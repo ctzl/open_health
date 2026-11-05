@@ -20,3 +20,7 @@ strip = true
 
 [patch."https://github.com/Th0rgal/open_oura"]
 oura-store = { path = "vendor/oura-store" }
+# Local: use our sibling open_oura fork (Windows BLE scan fix, history
+# cold-start fix) instead of the pinned upstream rev.
+oura-protocol = { path = "../open_oura/crates/oura-protocol" }
+oura-link = { path = "../open_oura/crates/oura-link" }
