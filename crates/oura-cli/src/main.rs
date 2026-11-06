@@ -256,6 +256,11 @@ enum Command {
         /// Local HTTP port.
         #[arg(long, default_value_t = 8090)]
         port: u16,
+        /// Also listen on all interfaces so other devices on the LAN can open
+        /// the dashboard (http://<this-machine>:PORT). Mutating endpoints keep
+        /// the CSRF header guard; only the loopback Host check is relaxed.
+        #[arg(long)]
+        lan: bool,
         /// Timezone offset (hours from UTC) for displayed times.
         #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
         tz_offset: f64,
@@ -498,6 +503,7 @@ async fn main() -> Result<()> {
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
         Command::Dashboard {
             port,
+            lan,
             tz_offset,
             sex,
             age,
@@ -519,6 +525,7 @@ async fn main() -> Result<()> {
             blood::set_files_dir(blood_files.clone());
             dashboard::serve(
                 *port,
+                *lan,
                 cli.db.clone(),
                 *tz_offset,
                 cli.name.clone(),

@@ -3,12 +3,18 @@
 # open_oura checkout. All data stays on this machine.
 #
 # Usage:
-#   .\run-dashboard.ps1                 # normal start
-#   .\run-dashboard.ps1 -Build          # rebuild the binary first
-#   .\run-dashboard.ps1 -Port 8095      # alternate port
+#   .
+un-dashboard.ps1                 # normal start (localhost only)
+#   .
+un-dashboard.ps1 -Lan            # also reachable from other LAN devices
+#   .
+un-dashboard.ps1 -Build          # rebuild the binary first
+#   .
+un-dashboard.ps1 -Port 8095      # alternate port
 
 param(
     [switch]$Build,
+    [switch]$Lan,
     [int]$Port = 8090
 )
 
@@ -48,5 +54,13 @@ if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyCon
 $tzOffset = [TimeZoneInfo]::Local.GetUtcOffset([DateTimeOffset]::Now).TotalHours
 
 Write-Host "tz offset: $tzOffset  db: $db"
+$lanArgs = @()
+if ($Lan) {
+    $lanArgs = @('--lan')
+    $ips = (Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress
+    Write-Host "LAN: open http://<$($ips -join '> or http://<')>:$Port from other devices"
+    Write-Host "note: Windows may prompt for a firewall rule on first LAN connection"
+}
 Write-Host "open http://127.0.0.1:$Port  (Ctrl+C to stop)"
-& $exe dashboard --db $db --key-file $keyFile --tz-offset $tzOffset --port $Port
+& $exe dashboard --db $db --key-file $keyFile --tz-offset $tzOffset --port $Port @lanArgs
