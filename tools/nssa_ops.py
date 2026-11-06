@@ -15,6 +15,7 @@ import hashlib
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -50,15 +51,19 @@ def native():
     src = C_SOURCE.read_bytes() + (C_SOURCE.with_suffix(".h")).read_bytes()
     tag = hashlib.sha256(src).hexdigest()[:16]
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "open_health"
-    lib = cache / f"nssa_ops_{tag}{'.dylib' if os.uname().sysname == 'Darwin' else '.so'}"
+    ext = {"darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
+    lib = cache / f"nssa_ops_{tag}{ext}"
     if not lib.is_file():
+        cc = os.environ.get("CC", "cl" if sys.platform == "win32" else "cc")
         try:
             cache.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / lib.name
-                subprocess.run([os.environ.get("CC", "cc"), "-O2", "-ffp-contract=off", "-shared", "-fPIC",
-                                str(C_SOURCE), "-o", str(out), "-lm"],
-                               check=True, capture_output=True, timeout=120)
+                if sys.platform == "win32":
+                    cmd = [cc, "/O2", "/fp:strict", "/LD", str(C_SOURCE), "/Fe:" + str(out)]
+                else:
+                    cmd = [cc, "-O2", "-ffp-contract=off", "-shared", "-fPIC", str(C_SOURCE), "-o", str(out), "-lm"]
+                subprocess.run(cmd, check=True, capture_output=True, timeout=120)
                 os.replace(out, lib)
         except (OSError, subprocess.SubprocessError):
             return None
