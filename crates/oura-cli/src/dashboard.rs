@@ -365,6 +365,7 @@ fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
 
 pub async fn serve(
     port: u16,
+    lan: bool,
     db: PathBuf,
     tz: f64,
     name: String,
@@ -376,15 +377,20 @@ pub async fn serve(
     if !profile_path(&db).exists() {
         let _ = write_profile(&db, &seed.to_json());
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    let bind_ip = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let listener = TcpListener::bind((bind_ip, port))
         .await
         .context("binding port")?;
-    println!("open_oura dashboard running — open http://127.0.0.1:{port} in your browser");
+    if lan {
+        println!("open_oura dashboard running — open http://127.0.0.1:{port} locally, or http://<this machine's LAN IP>:{port} from other devices");
+    } else {
+        println!("open_oura dashboard running — open http://127.0.0.1:{port} in your browser");
+    }
     loop {
         let (sock, _) = listener.accept().await?;
         let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
         tokio::spawn(async move {
-            let _ = handle(sock, port, db, tz, name, key_file).await;
+            let _ = handle(sock, port, lan, db, tz, name, key_file).await;
         });
     }
 }
@@ -472,6 +478,7 @@ async fn json_resp(sock: &mut TcpStream, v: &Value) -> Result<()> {
 async fn handle(
     mut sock: TcpStream,
     port: u16,
+    lan: bool,
     db: PathBuf,
     tz: f64,
     name: String,
@@ -487,9 +494,15 @@ async fn handle(
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     let body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
 
-    // Loopback-only (DNS-rebind guard).
-    let host_ok = header(&req, "host")
-        .is_some_and(|h| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}"));
+    // Loopback-only (DNS-rebind guard). With --lan the user opted into serving
+    // the LAN, so any host is accepted as long as it targets our port (a
+    // rebinding attack still cannot reach a nonstandard port blindly).
+    let host_ok = if lan {
+        header(&req, "host").is_some_and(|h| h.ends_with(&format!(":{port}")))
+    } else {
+        header(&req, "host")
+            .is_some_and(|h| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}"))
+    };
     if !host_ok {
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
