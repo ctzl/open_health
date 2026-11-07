@@ -35,6 +35,13 @@ EPOCH_MS = 30000
 JSON = "--json" in sys.argv
 BATCH = "--batch" in sys.argv
 args = [a for a in sys.argv[1:] if a not in ("--json", "--batch")]
+# --serial restricts every event read to one ring (multi-ring DBs); the cache key
+# includes it so two rings' nights never share an entry.
+SERIAL = None
+if "--serial" in args:
+    i = args.index("--serial")
+    SERIAL = args[i + 1]
+    del args[i:i + 2]
 start_ds = end_ds = None
 if not BATCH and len(args) >= 2 and args[0].isdigit():
     start_ds, end_ds = int(args[0]), int(args[1])
@@ -58,9 +65,13 @@ def read_profile(db):
 
 
 con = sqlite3.connect(str(DB))
+_where = "WHERE (decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14))"
+_qparams = ()
+if SERIAL:
+    _where += " AND serial = ?"
+    _qparams = (SERIAL,)
 rows = con.execute("SELECT ring_timestamp, tag, COALESCE(decoded_json, '{}'), captured_unix, body FROM events "
-                   "WHERE decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14) "
-                   "ORDER BY captured_unix, id").fetchall()
+                   + _where + " ORDER BY captured_unix, id", _qparams).fetchall()
 _epochs = build_epochs([r[:4] for r in rows])
 _unix_s = make_unix_s(_epochs)
 
@@ -138,7 +149,7 @@ def save_cache():
 def stage_bedtime(b_start, b_end, cu, demo):
     """NSSA epochs for one ring bedtime: (epoch start ms list, codes) or None."""
     inputs = collect_nssa_inputs(decoded_rows(), b_start, b_end, cu, ms, correct_ibis)
-    key = hashlib.sha256(json.dumps([CACHE_VERSION, demo, inputs], sort_keys=True).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps([CACHE_VERSION, SERIAL, demo, inputs], sort_keys=True).encode()).hexdigest()
     hit = cache()["nights"].get(key)
     if hit is not None:
         return (hit["t"], hit["s"]) if hit else None
@@ -234,7 +245,9 @@ if BATCH:
     sys.exit(0)
 
 if start_ds is None:  # default: most recent bedtime_period in the DB
-    bt = con.execute("SELECT decoded_json FROM events WHERE tag=118 ORDER BY captured_unix DESC, id DESC").fetchone()
+    bt = con.execute("SELECT decoded_json FROM events WHERE tag=118"
+                     + (" AND serial = ?" if SERIAL else "")
+                     + " ORDER BY captured_unix DESC, id DESC", (SERIAL,) if SERIAL else ()).fetchone()
     if bt is None:
         raise SystemExit("no bedtime_period (tag 0x76) in DB — pass start/end deciseconds or sync overnight data first")
     v = json.loads(bt[0])

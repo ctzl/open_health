@@ -80,12 +80,13 @@ def decode_cva_ppg_bodies(bodies):
     return np.asarray(samples, dtype=np.float32)
 
 
-def build_segments(db, since_ds):
+def build_segments(db, since_ds, serial=None):
     con = sqlite3.connect(str(db))
     rows = con.execute(
-        "SELECT ring_timestamp, body FROM events WHERE tag=129 AND ring_timestamp>? "
-        "ORDER BY ring_timestamp",
-        (since_ds,),
+        "SELECT ring_timestamp, body FROM events WHERE tag=129 AND ring_timestamp>?"
+        + (" AND serial = ?" if serial else "")
+        + " ORDER BY ring_timestamp",
+        (since_ds, serial) if serial else (since_ds,),
     ).fetchall()
     con.close()
     if not rows:
@@ -128,6 +129,7 @@ def main():
     p.add_argument("--weight", type=float, default=None, help="kg")
     p.add_argument("--ring", type=float, default=None, help="ring size")
     p.add_argument("--since-cursor", type=int, default=0, help="only events with ring_timestamp > this")
+    p.add_argument("--serial", default=None, help="only this ring's events (multi-ring DBs)")
     p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = p.parse_args()
     model_path = find_model()
@@ -141,7 +143,7 @@ def main():
     args.weight = float(pick(args.weight, "weight_kg", 75.0))
     args.ring = float(pick(args.ring, "ring_size", 10.0))
 
-    segs, seg_ts, n_runs = build_segments(db, args.since_cursor)
+    segs, seg_ts, n_runs = build_segments(db, args.since_cursor, args.serial)
     if not segs:
         sys.exit(f"no full {SEG_LEN}-sample PPG segment available ({n_runs} measurement runs, all too short)")
     ppg = torch.tensor(np.stack(segs), dtype=torch.float32)

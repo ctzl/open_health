@@ -111,9 +111,14 @@ impl Bar {
 /// ```
 /// `low`/`high` are the 5th/95th percentiles — the band the hour actually lived in.
 /// This is [`hr_bins`] at 60 minutes under the `hours` key the iOS app reads.
-pub fn hourly_hr(db: &Path, tz: impl Into<crate::OffsetHours>, days: u32) -> Result<Value> {
+pub fn hourly_hr(
+    db: &Path,
+    tz: impl Into<crate::OffsetHours>,
+    days: u32,
+    serial: Option<&str>,
+) -> Result<Value> {
     let tz = tz.into().0;
-    let mut v = hr_bins(db, tz, days, 60)?;
+    let mut v = hr_bins(db, tz, days, 60, serial)?;
     let bins = v
         .as_object_mut()
         .and_then(|o| o.remove("bins"))
@@ -134,6 +139,7 @@ pub fn hr_bins(
     tz: impl Into<crate::OffsetHours>,
     days: u32,
     minutes: u32,
+    serial: Option<&str>,
 ) -> Result<Value> {
     let tz = tz.into().0;
     if minutes == 0 || 60 % minutes != 0 {
@@ -142,7 +148,10 @@ pub fn hr_bins(
     anyhow::ensure!(tz.is_finite() && (-24.0..=24.0).contains(&tz), "invalid UTC offset");
     let span = minutes as i64 * 60;
     let store = Store::open_read_only(db).context("opening DB")?;
-    let events = store.decoded_events().context("reading events")?;
+    let events = match serial {
+        Some(s) => store.decoded_events_for(s).context("reading events")?,
+        None => store.decoded_events().context("reading events")?,
+    };
     if events.is_empty() {
         return Ok(
             json!({ "tz_offset": tz, "minutes": minutes, "bins": [], "latest": Value::Null }),
@@ -385,7 +394,7 @@ mod tests {
             );
         }
 
-        let v = hourly_hr(&db, 0, 0).unwrap();
+        let v = hourly_hr(&db, 0, 0, None).unwrap();
         let hours = v["hours"].as_array().unwrap();
         assert_eq!(hours.len(), 3, "{v}");
         assert_eq!(hours[0]["min"], 60.0);
@@ -422,9 +431,9 @@ mod tests {
     fn rejects_bin_sizes_that_do_not_divide_an_hour() {
         // checked before the DB is touched, so a missing path is fine here
         let missing = Path::new("/nonexistent/oura.db");
-        assert!(hr_bins(missing, 0, 0, 7).is_err());
-        assert!(hr_bins(missing, 0, 0, 0).is_err());
-        assert!(hr_bins(missing, 0, 0, 90).is_err());
+        assert!(hr_bins(missing, 0, 0, 7, None).is_err());
+        assert!(hr_bins(missing, 0, 0, 0, None).is_err());
+        assert!(hr_bins(missing, 0, 0, 90, None).is_err());
     }
 
     /// 15-minute slots over a real store: beats split by quarter hour, and a slot
@@ -484,7 +493,7 @@ mod tests {
             );
         }
 
-        let v = hr_bins(&db, 0, 0, 15).unwrap();
+        let v = hr_bins(&db, 0, 0, 15, None).unwrap();
         assert_eq!(v["minutes"], 15);
         let bins = v["bins"].as_array().unwrap();
         assert_eq!(bins.len(), 3, "{v}");
@@ -512,7 +521,7 @@ mod tests {
         assert_eq!(bins[2]["count"], 3);
 
         // the hourly contract the iOS app reads is unchanged: same data, `hours` key
-        let h = hourly_hr(&db, 0, 0).unwrap();
+        let h = hourly_hr(&db, 0, 0, None).unwrap();
         assert_eq!(h["hours"].as_array().unwrap().len(), 2, "{h}");
         assert!(h.get("bins").is_none());
 
@@ -526,7 +535,7 @@ mod tests {
         let db = dir.join("oura.db");
         let _ = std::fs::remove_file(&db);
         drop(Store::open(db.to_str().unwrap()).unwrap());
-        let v = hourly_hr(&db, 0, 7).unwrap();
+        let v = hourly_hr(&db, 0, 7, None).unwrap();
         assert_eq!(v["hours"].as_array().unwrap().len(), 0);
         assert!(v["latest"].is_null());
         let _ = std::fs::remove_file(&db);

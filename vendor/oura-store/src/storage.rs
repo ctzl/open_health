@@ -70,13 +70,40 @@ CREATE TABLE IF NOT EXISTS readings (
     captured_unix INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_serial_kind ON readings(serial, kind);
+
+-- Ring registry: one row per physical ring, with a user-set label. Rows are
+-- auto-created on first contact (upsert_device) with a default name; the CLI
+-- and dashboard rename them. `auth_key_hex` is a convenience mirror of the
+-- key file — the key file stays authoritative for BLE auth.
+CREATE TABLE IF NOT EXISTS rings (
+    serial         TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    auth_key_hex   TEXT,
+    key_source     TEXT,
+    note           TEXT,
+    added_unix     INTEGER NOT NULL,
+    last_seen_unix INTEGER
+);
 "#;
+
+/// Current ring-registry schema version stored in `store_meta`.
+pub const RING_REGISTRY_VERSION: i64 = 1;
 
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Placeholder label for a ring the user has not named yet.
+fn default_ring_name(serial: &str) -> String {
+    let tail = serial
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>();
+    format!("Ring {}", tail.iter().rev().collect::<String>())
 }
 
 /// Decode an event body for storage or migration while preserving provenance and
@@ -142,6 +169,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         let store = Self { conn };
         store.ensure_decoder_version()?;
+        store.ensure_ring_registry()?;
         Ok(store)
     }
 
@@ -246,6 +274,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         let store = Self { conn };
         store.ensure_decoder_version()?;
+        store.ensure_ring_registry()?;
         Ok(store)
     }
 
@@ -274,7 +303,133 @@ impl Store {
                 now_unix(),
             ],
         )?;
+        self.register_ring(serial)?;
         Ok(())
+    }
+
+    // ---- ring registry -----------------------------------------------------
+
+    /// Ensure the registry exists and is at the current version; on first
+    /// creation, adopt every serial already present in `device`/`events` with a
+    /// default name, and seed names/keys for known rings.
+    fn ensure_ring_registry(&self) -> Result<()> {
+        let version: i64 = self
+            .get_meta("ring_registry_version")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if version >= RING_REGISTRY_VERSION {
+            return Ok(());
+        }
+        let mut serials: Vec<String> = Vec::new();
+        for table in ["device", "events"] {
+            let found = self
+                .conn
+                .prepare_cached(&format!("SELECT DISTINCT serial FROM {table}"))?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            serials.extend(found);
+        }
+        serials.sort();
+        serials.dedup();
+        let now = now_unix();
+        for serial in serials {
+            self.conn.execute(
+                "INSERT INTO rings (serial, name, added_unix)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(serial) DO NOTHING",
+                params![serial, default_ring_name(&serial), now],
+            )?;
+        }
+        Self::set_meta(&self.conn, "ring_registry_version", &RING_REGISTRY_VERSION.to_string())?;
+        Ok(())
+    }
+
+    /// Create-or-refresh a registry row for `serial` (never overwrites a name).
+    pub fn register_ring(&self, serial: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rings (serial, name, added_unix, last_seen_unix)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(serial) DO UPDATE SET last_seen_unix = excluded.last_seen_unix",
+            params![serial, default_ring_name(serial), now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Set a ring's user-visible label (and optionally a note). Returns false if
+    /// the serial is not registered.
+    pub fn rename_ring(&self, serial: &str, name: &str, note: Option<&str>) -> Result<bool> {
+        let changed = match note {
+            Some(note) => self.conn.execute(
+                "UPDATE rings SET name = ?2, note = ?3 WHERE serial = ?1",
+                params![serial, name, note],
+            )?,
+            None => self.conn.execute(
+                "UPDATE rings SET name = ?2 WHERE serial = ?1",
+                params![serial, name],
+            )?,
+        };
+        Ok(changed > 0)
+    }
+
+    /// Update the stored key mirror for a ring (the key file stays authoritative).
+    pub fn set_ring_key(&self, serial: &str, key_hex: &str, source: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE rings SET auth_key_hex = ?2, key_source = ?3 WHERE serial = ?1",
+            params![serial, key_hex, source],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The stored auth key for one ring, as hex (see `set_ring_key`). Lets a
+    /// multi-ring dashboard sync each ring with *its* key instead of one global key.
+    pub fn ring_key(&self, serial: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT auth_key_hex FROM rings WHERE serial = ?1 AND auth_key_hex IS NOT NULL",
+                params![serial],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every registered ring with its activity, for the CLI and the dashboard
+    /// switcher. Returns
+    /// `(serial, name, note, added_unix, last_seen_unix, last_sync_unix, next_cursor, event_count)`,
+    /// most-recently-active first.
+    #[allow(clippy::type_complexity)]
+    pub fn list_rings(&self) -> Result<Vec<(String, String, Option<String>, i64, i64, i64, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.serial, r.name, r.note, r.added_unix, COALESCE(r.last_seen_unix,0),
+                    COALESCE(s.last_sync_unix,0), COALESCE(s.next_cursor,0),
+                    (SELECT COUNT(*) FROM events e WHERE e.serial = r.serial)
+             FROM rings r
+             LEFT JOIN sync_state s ON s.serial = r.serial
+             ORDER BY COALESCE(s.last_sync_unix, r.last_seen_unix, r.added_unix) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The registered name for a serial, if any.
+    pub fn ring_name(&self, serial: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT name FROM rings WHERE serial = ?1", params![serial], |r| r.get(0))
+            .optional()?)
     }
 
     /// Device identity + last-sync for display: the most-recently-updated device
@@ -284,29 +439,50 @@ impl Store {
     pub fn device_info(
         &self,
     ) -> Result<Option<(String, String, String, String, String, i64, i64, i64)>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT d.serial, COALESCE(d.hardware_id,''), COALESCE(d.firmware,''),
-                        COALESCE(d.api_version,''), COALESCE(d.mac,''), COALESCE(d.updated_unix,0),
-                        COALESCE(s.last_sync_unix,0), COALESCE(s.next_cursor,0)
-                 FROM device d LEFT JOIN sync_state s ON s.serial = d.serial
-                 ORDER BY d.updated_unix DESC LIMIT 1",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, i64>(7)?,
-                    ))
-                },
-            )
-            .optional()?;
+        self.device_info_filtered(None)
+    }
+
+    /// Same as `device_info` but for one specific serial (the multi-ring path).
+    pub fn device_info_for(
+        &self,
+        serial: &str,
+    ) -> Result<Option<(String, String, String, String, String, i64, i64, i64)>> {
+        self.device_info_filtered(Some(serial))
+    }
+
+    fn device_info_filtered(
+        &self,
+        serial: Option<&str>,
+    ) -> Result<Option<(String, String, String, String, String, i64, i64, i64)>> {
+        let map = |r: &rusqlite::Row| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        };
+        let sql = if serial.is_some() {
+            "SELECT d.serial, COALESCE(d.hardware_id,''), COALESCE(d.firmware,''),
+                    COALESCE(d.api_version,''), COALESCE(d.mac,''), COALESCE(d.updated_unix,0),
+                    COALESCE(s.last_sync_unix,0), COALESCE(s.next_cursor,0)
+             FROM device d LEFT JOIN sync_state s ON s.serial = d.serial
+             WHERE d.serial = ?1"
+        } else {
+            "SELECT d.serial, COALESCE(d.hardware_id,''), COALESCE(d.firmware,''),
+                    COALESCE(d.api_version,''), COALESCE(d.mac,''), COALESCE(d.updated_unix,0),
+                    COALESCE(s.last_sync_unix,0), COALESCE(s.next_cursor,0)
+             FROM device d LEFT JOIN sync_state s ON s.serial = d.serial
+             ORDER BY d.updated_unix DESC LIMIT 1"
+        };
+        let row = match serial {
+            Some(s) => self.conn.query_row(sql, params![s], map).optional()?,
+            None => self.conn.query_row(sql, [], map).optional()?,
+        };
         Ok(row)
     }
 
@@ -531,29 +707,46 @@ impl Store {
     /// `ring_start` (`0x41`) reboot records even when `decoded_json` is NULL on an
     /// unmigrated read-only database so reboot boundaries are never hidden.
     pub fn decoded_events(&self) -> Result<Vec<(i64, u8, String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        self.decoded_events_filtered(None)
+    }
+
+    /// Decoded events for one device serial only — the multi-ring path.
+    pub fn decoded_events_for(&self, serial: &str) -> Result<Vec<(i64, u8, String, i64)>> {
+        self.decoded_events_filtered(Some(serial))
+    }
+
+    fn decoded_events_filtered(&self, serial: Option<&str>) -> Result<Vec<(i64, u8, String, i64)>> {
+        let where_serial = if serial.is_some() { "WHERE serial = ?1 AND " } else { "WHERE " };
+        let sql = format!(
             "SELECT ring_timestamp, tag, decoded_json, captured_unix, \
                     CASE WHEN decoded_json IS NULL THEN body ELSE NULL END \
              FROM events \
-             WHERE decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14) \
-             ORDER BY captured_unix, id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                let ts = r.get::<_, i64>(0)?;
-                let tag = r.get::<_, i64>(1)? as u8;
-                let decoded_opt = r.get::<_, Option<String>>(2)?;
-                let captured = r.get::<_, i64>(3)?;
-                let json = match decoded_opt {
-                    Some(s) => s,
-                    None => {
-                        let body = r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
-                        decode_stored_event(tag, &body, None).unwrap_or_else(|| "{}".to_string())
-                    }
-                };
-                Ok((ts, tag, json, captured))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+             {where_serial}(decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14)) \
+             ORDER BY captured_unix, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(i64, u8, String, i64)> {
+            let ts = r.get::<_, i64>(0)?;
+            let tag = r.get::<_, i64>(1)? as u8;
+            let decoded_opt = r.get::<_, Option<String>>(2)?;
+            let captured = r.get::<_, i64>(3)?;
+            let json = match decoded_opt {
+                Some(s) => s,
+                None => {
+                    let body = r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+                    decode_stored_event(tag, &body, None).unwrap_or_else(|| "{}".to_string())
+                }
+            };
+            Ok((ts, tag, json, captured))
+        };
+        let rows = match serial {
+            Some(s) => stmt
+                .query_map(params![s], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
         Ok(rows)
     }
 
@@ -612,6 +805,57 @@ mod tests {
             body: vec![1, 2, 3],
             decoded: None,
         }
+    }
+
+    #[test]
+    fn ring_registry_auto_names_and_preserves_renames() {
+        let store = Store::open_in_memory().unwrap();
+        // First contact via device upsert auto-registers with a default name.
+        store.upsert_device("40160B2500000001", None, None).unwrap();
+        let rings = store.list_rings().unwrap();
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].0, "40160B2500000001");
+        assert_eq!(rings[0].1, "Ring 0001");
+
+        // Renaming sticks; a later contact must not clobber it.
+        assert!(store.rename_ring("40160B2500000001", "Daily ring", Some("unbanned")).unwrap());
+        store.upsert_device("40160B2500000001", None, None).unwrap();
+        assert_eq!(store.ring_name("40160B2500000001").unwrap().unwrap(), "Daily ring");
+        assert!(!store.rename_ring("nope", "x", None).unwrap());
+
+        // A second ring gets its own default name; the rename survives.
+        store.upsert_device("40160B2500000002", None, None).unwrap();
+        let rings = store.list_rings().unwrap();
+        assert_eq!(rings.len(), 2);
+        let by_serial: std::collections::HashMap<_, _> =
+            rings.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+        assert_eq!(by_serial["40160B2500000002"], "Ring 0002");
+        assert_eq!(by_serial["40160B2500000001"], "Daily ring");
+    }
+
+    #[test]
+    fn ring_registry_adopts_existing_serials_on_open() {
+        let dir = std::env::temp_dir().join(format!("oura-store-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            // Simulate a pre-registry database: events exist, no rings table.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO events (serial, tag, name, ring_timestamp, body, captured_unix)
+                 VALUES ('S_LEGACY', 0x43, 'debug_event', 42, X'0102', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rings = store.list_rings().unwrap();
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].0, "S_LEGACY");
+        assert_eq!(rings[0].7, 1, "event count is reported");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

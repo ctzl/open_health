@@ -81,6 +81,9 @@ pub struct ModelInputs<'a> {
     pub tz: f64,
     pub demo: &'a Demographics,
     pub sleep_ranges: &'a [[i64; 3]],
+    /// The ring this run describes — Python runners filter events by it and key
+    /// their caches by it, so two rings' nights never cross-contaminate.
+    pub serial: &'a str,
 }
 
 /// Raw model outputs, matching the Python runners' `--json` shape.
@@ -1285,12 +1288,19 @@ pub fn stage_night_from_signals(
 /// Fallback batch stager for desktop/CLI runs when the proprietary `.pt` model is
 /// unavailable on the machine. Reads nocturnal `hrv_event` (`0x5d`) and `motion_event`
 /// (`0x47`) streams from `db` and returns the same JSON batch shape as `run_sleep_model.py`.
-pub fn stage_nights_from_signals(db: &Path, sleep_ranges: &[[i64; 3]]) -> Option<Value> {
+pub fn stage_nights_from_signals(
+    db: &Path,
+    sleep_ranges: &[[i64; 3]],
+    serial: Option<&str>,
+) -> Option<Value> {
     if sleep_ranges.is_empty() {
         return Some(Value::Array(Vec::new()));
     }
     let store = Store::open_read_only(db).ok()?;
-    let events = store.decoded_events().ok()?;
+    let events = match serial {
+        Some(s) => store.decoded_events_for(s).ok()?,
+        None => store.decoded_events().ok()?,
+    };
     let mut results = Vec::with_capacity(sleep_ranges.len());
     for &[start_ds, end_ds, captured_unix] in sleep_ranges {
         let mut hr_t = Vec::new();
@@ -2068,11 +2078,38 @@ fn make_digest(hrv: &VitalStat, rhr: &VitalStat) -> String {
     s
 }
 
+/// Resolve `serial` for a summary request: an explicit serial must be registered;
+/// `None` auto-detects a single-device DB (exactly one serial in the registry) and
+/// errors when more than one ring shares the DB — the caller must then choose.
+pub fn resolve_summary_serial(store: &Store, serial: Option<&str>) -> Result<String> {
+    let rings = store.list_rings().unwrap_or_default();
+    match serial {
+        Some(s) => {
+            if rings.iter().any(|r| r.0 == s) {
+                Ok(s.to_string())
+            } else {
+                anyhow::bail!("unknown ring serial {s} — not in the registry")
+            }
+        }
+        None => match rings.len() {
+            0 => anyhow::bail!("no rings registered — run `oura sync` first"),
+            1 => Ok(rings[0].0.clone()),
+            n => anyhow::bail!(
+                "{n} rings share this database — pass a serial (the dashboard's \
+                 ring switcher picks one)"
+            ),
+        },
+    }
+}
+
 /// Assemble the full dashboard summary as a JSON value. The torch models are
 /// supplied by `runner` (Python subprocess on desktop, `.ptl` on-device).
+/// `serial` selects which ring the summary describes; `None` auto-detects a
+/// single-device DB (see [`resolve_summary_serial`]).
 pub fn build_summary(
     db: &Path,
     tz: impl Into<OffsetHours>,
+    serial: Option<&str>,
     runner: &dyn ModelRunner,
 ) -> Result<Value> {
     let tz = tz.into().0;
@@ -2089,15 +2126,19 @@ pub fn build_summary(
     let demo = read_profile(db);
     let _ = Store::migrate_if_writable(db);
     let store = Store::open_read_only(db).context("opening DB")?;
-    let events = store.decoded_events().context("reading events")?;
+    let serial = resolve_summary_serial(&store, serial)?;
+    let ring_name = store.ring_name(&serial)?.unwrap_or_else(|| serial.clone());
+    let events = store
+        .decoded_events_for(&serial)
+        .context("reading events")?;
     if events.is_empty() {
         return Err(anyhow!(
-            "no decoded events in {} — run `oura sync` first",
+            "no decoded events for ring {serial} in {} — run `oura sync` first",
             db.display()
         ));
     }
     let (raw_events_total, decoded_events_total) =
-        store.event_totals().unwrap_or((events.len(), events.len()));
+        store.serial_event_totals(&serial).unwrap_or((events.len(), events.len()));
     let clock = RingClock::from_events(&events);
     let history_stats = clock.trusted_history_stats(&events, tz);
     let unix_s_at = |ds: i64, captured_unix: i64| clock.unix_s(ds, captured_unix);
@@ -2418,6 +2459,7 @@ pub fn build_summary(
         tz,
         demo: &demo,
         sleep_ranges: &sleep_ranges,
+        serial: &serial,
     });
 
     let mut hyps: std::collections::HashMap<(i64, i64), Value> = sleep_batch
@@ -2980,7 +3022,7 @@ pub fn build_summary(
         }
     }
 
-    let dev = store.device_info().ok().flatten();
+    let dev = store.device_info_for(&serial).ok().flatten();
     let last_sync = dev.as_ref().map(|d| d.6).filter(|&t| t > 0);
     let synced_unix = last_sync.map(|t| t as f64);
 
@@ -2989,7 +3031,8 @@ pub fn build_summary(
         .map(|d| d.as_secs() as f64)
         .unwrap_or(anchor_unix as f64);
     let device = json!({
-        "serial": dev.as_ref().map(|d| d.0.clone()),
+        "serial": dev.as_ref().map(|d| d.0.clone()).or_else(|| Some(serial.clone())),
+        "ring_name": ring_name,
         "hardware_id": dev.as_ref().map(|d| d.1.clone()).filter(|s| !s.is_empty()),
         "firmware": dev.as_ref().map(|d| d.2.clone()).filter(|s| !s.is_empty()),
         "api_version": dev.as_ref().map(|d| d.3.clone()).filter(|s| !s.is_empty()),

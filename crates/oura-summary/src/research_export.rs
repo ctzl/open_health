@@ -93,6 +93,8 @@ pub struct Request {
     pub streams: Vec<Stream>,
     /// Fixed UTC offset for the `local_time` column (the UTC column is authoritative).
     pub tz_offset_hours: f64,
+    /// Restrict the export to one ring's events; `None` exports every device.
+    pub serial: Option<String>,
 }
 
 /// The finished export: files in a fixed order (`README.md`, `manifest.json`, then
@@ -139,8 +141,14 @@ pub fn build(db: &Path, req: &Request) -> Result<Export> {
     anyhow::ensure!(!streams.is_empty(), "choose at least one data stream");
 
     let store = Store::open_read_only(db).context("opening DB")?;
-    let events = store.decoded_events().context("reading events")?;
-    let device = store.device_info().ok().flatten();
+    let events = match req.serial.as_deref() {
+        Some(s) => store.decoded_events_for(s).context("reading events")?,
+        None => store.decoded_events().context("reading events")?,
+    };
+    let device = match req.serial.as_deref() {
+        Some(s) => store.device_info_for(s).ok().flatten(),
+        None => store.device_info().ok().flatten(),
+    };
     let clock = (!events.is_empty()).then(|| RingClock::from_events(&events));
 
     let mut rows: BTreeMap<Stream, Vec<Row>> = streams.iter().map(|s| (*s, Vec::new())).collect();
@@ -312,9 +320,12 @@ pub fn build(db: &Path, req: &Request) -> Result<Export> {
 /// Record a "mark now" event at `unix` (phone clock) with a free-text label, so a
 /// researcher can line the ring data up with another recording (start of an audio
 /// recording, a noise played on purpose). Exported as `markers.csv`.
-pub fn add_marker(db: &Path, unix: f64, label: &str) -> Result<()> {
+pub fn add_marker(db: &Path, unix: f64, label: &str, serial: Option<&str>) -> Result<()> {
     let store = Store::open(db).context("opening DB")?;
-    let serial = store.device_serials().ok().and_then(|s| s.into_iter().next()).unwrap_or_default();
+    let serial = serial
+        .map(|s| s.to_string())
+        .or_else(|| store.device_serials().ok().and_then(|s| s.into_iter().next()))
+        .unwrap_or_default();
     let label: String = label.chars().filter(|c| !c.is_control()).take(200).collect();
     store.insert_reading(&serial, MARKER_KIND, unix, label.trim())?;
     Ok(())
@@ -322,12 +333,21 @@ pub fn add_marker(db: &Path, unix: f64, label: &str) -> Result<()> {
 
 fn read_markers(db: &Path, req: &Request) -> Result<Vec<(f64, String)>> {
     let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = conn.prepare(
-        "SELECT value, COALESCE(unit, '') FROM readings WHERE kind = ?1 AND value >= ?2 AND value < ?3 ORDER BY value, id",
-    )?;
-    let rows = stmt
-        .query_map(rusqlite::params![MARKER_KIND, req.start_unix, req.end_unix], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let map = |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?));
+    let rows = match req.serial.as_deref() {
+        Some(s) => conn
+            .prepare(
+                "SELECT value, COALESCE(unit, '') FROM readings WHERE kind = ?1 AND serial = ?4 AND value >= ?2 AND value < ?3 ORDER BY value, id",
+            )?
+            .query_map(rusqlite::params![MARKER_KIND, req.start_unix, req.end_unix, s], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => conn
+            .prepare(
+                "SELECT value, COALESCE(unit, '') FROM readings WHERE kind = ?1 AND value >= ?2 AND value < ?3 ORDER BY value, id",
+            )?
+            .query_map(rusqlite::params![MARKER_KIND, req.start_unix, req.end_unix], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
     Ok(rows)
 }
 
@@ -547,9 +567,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("t.db");
         drop(Store::open(&db).unwrap());
-        add_marker(&db, 1000.25, "noise, 60 dB").unwrap();
-        add_marker(&db, 5000.0, "outside").unwrap();
-        let req = Request { start_unix: 0.0, end_unix: 2000.0, streams: vec![Stream::Motion], tz_offset_hours: 0.0 };
+        add_marker(&db, 1000.25, "noise, 60 dB", None).unwrap();
+        add_marker(&db, 5000.0, "outside", None).unwrap();
+        let req = Request { start_unix: 0.0, end_unix: 2000.0, streams: vec![Stream::Motion], tz_offset_hours: 0.0, serial: None };
         let export = build(&db, &req).unwrap();
         let (_, csv) = export.files.iter().find(|(n, _)| n == "markers.csv").unwrap();
         assert_eq!(csv, "utc_time,local_time,unix_s,label,clock_source\n1970-01-01T00:16:40.250Z,1970-01-01T00:16:40.250Z,1000.250,\"noise, 60 dB\",phone\n");

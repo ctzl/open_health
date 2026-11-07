@@ -34,9 +34,12 @@ pub fn rmssd(ibi_ms: Vec<u16>) -> f64 {
 /// Returns the summary JSON string, or `{ "error": "…" }`.
 #[uniffi::export]
 pub fn summary_json(db_path: String, tz_offset: i64) -> String {
+    // The phone's DB holds one ring, so serial=None auto-detects it. If the app
+    // ever syncs two rings, add a serial parameter here and thread it through.
     match oura_summary::build_summary(
         std::path::Path::new(&db_path),
         tz_offset,
+        None,
         &oura_summary::NoModelRunner,
     ) {
         Ok(v) => v.to_string(),
@@ -55,7 +58,7 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
 /// Returns the JSON string, or `{ "error": "…" }`.
 #[uniffi::export]
 pub fn hourly_hr_json(db_path: String, tz_offset: i64, days: u32) -> String {
-    match oura_summary::hourly_hr::hourly_hr(std::path::Path::new(&db_path), tz_offset, days) {
+    match oura_summary::hourly_hr::hourly_hr(std::path::Path::new(&db_path), tz_offset, days, None) {
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e.to_string() }).to_string(),
     }
@@ -387,7 +390,7 @@ pub fn research_export(
         .iter()
         .map(|id| rx::Stream::from_id(id).ok_or_else(|| SyncError::Failed(format!("unknown stream {id:?}"))))
         .collect::<Result<Vec<_>, _>>()?;
-    let req = rx::Request { start_unix, end_unix, streams, tz_offset_hours };
+    let req = rx::Request { start_unix, end_unix, streams, tz_offset_hours, serial: None };
     let fail = |e: anyhow::Error| SyncError::Failed(e.to_string());
     let export = rx::build(std::path::Path::new(&db_path), &req).map_err(fail)?;
     let name = rx::bundle_name(start_unix, tz_offset_hours);
@@ -404,7 +407,7 @@ pub fn add_research_marker(db_path: String, label: String) -> Result<f64, SyncEr
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64 / 1000.0)
         .unwrap_or(0.0);
-    oura_summary::research_export::add_marker(std::path::Path::new(&db_path), now, &label)
+    oura_summary::research_export::add_marker(std::path::Path::new(&db_path), now, &label, None)
         .map_err(|e| SyncError::Failed(e.to_string()))?;
     Ok(now)
 }

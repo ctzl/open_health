@@ -169,6 +169,7 @@ impl ModelRunner for PythonRunner {
             tz,
             demo,
             sleep_ranges,
+            serial,
         } = input;
         let root = repo_root();
         let py = root.as_deref().map(python_bin);
@@ -178,6 +179,8 @@ impl ModelRunner for PythonRunner {
             tz.to_string(),
             "--json".into(),
             "--batch".into(),
+            "--serial".into(),
+            serial.to_string(),
         ];
         let cva_args = vec![
             db.display().to_string(),
@@ -192,14 +195,18 @@ impl ModelRunner for PythonRunner {
             demo.weight_kg.to_string(),
             "--ring".into(),
             demo.ring_size.to_string(),
+            "--serial".into(),
+            serial.to_string(),
         ];
         let act_args = vec![
             db.display().to_string(),
             "--tz".into(),
             tz.to_string(),
             "--json".into(),
+            "--serial".into(),
+            serial.to_string(),
         ];
-        let illness_args = vec![db.display().to_string(), tz.to_string(), "--json".into()];
+        let illness_args = vec![db.display().to_string(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
 
         let (mut sleep_batch, cva, activity, illness) = match (root.as_deref(), py.as_deref()) {
             (Some(r), Some(p)) => std::thread::scope(|s| {
@@ -221,7 +228,7 @@ impl ModelRunner for PythonRunner {
         if sleep_batch_needs_fallback(sleep_batch.as_ref(), sleep_ranges.len())
             && !sleep_ranges.is_empty()
         {
-            let signals = oura_summary::stage_nights_from_signals(db, sleep_ranges);
+            let signals = oura_summary::stage_nights_from_signals(db, sleep_ranges, Some(serial));
             sleep_batch = merge_sleep_fallback(sleep_batch, signals);
         }
         ModelOutputs {
@@ -280,8 +287,8 @@ fn merge_sleep_fallback(python: Option<Value>, signals: Option<Value>) -> Option
 }
 
 /// `build_summary` for the web dashboard — runs the models via Python.
-fn build_summary(db: &Path, tz: f64) -> Result<Value> {
-    oura_summary::build_summary(db, tz, &PythonRunner)
+fn build_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<Value> {
+    oura_summary::build_summary(db, tz, serial, &PythonRunner)
 }
 
 // ── summary cache ─────────────────────────────────────────────────────────────
@@ -293,6 +300,7 @@ fn build_summary(db: &Path, tz: f64) -> Result<Value> {
 struct SummaryCache {
     db: PathBuf,
     tz: f64,
+    serial: String, // the summary is per-ring; each ring caches separately
     token: CacheToken, // (db, profile.json, feature_modes.json, bedtime_overrides.json) mtimes
     value: Arc<Value>,
 }
@@ -319,27 +327,55 @@ fn summary_token(db: &Path) -> CacheToken {
     )
 }
 
-fn summary_cache() -> &'static Mutex<Option<SummaryCache>> {
-    static C: OnceLock<Mutex<Option<SummaryCache>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
+fn summary_cache() -> &'static Mutex<Vec<SummaryCache>> {
+    static C: OnceLock<Mutex<Vec<SummaryCache>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Resolve `?serial=` against the registry: a unique prefix is accepted, and with
+/// exactly one registered ring an omitted serial resolves to it (single-ring DBs
+/// keep working unchanged).
+fn resolve_summary_serial(db: &Path, want: Option<&str>) -> Result<String> {
+    let store = oura_store::storage::Store::open_read_only(db).context("opening DB")?;
+    let rings = store.list_rings().unwrap_or_default();
+    let Some(want) = want else {
+        return oura_summary::resolve_summary_serial(&store, None);
+    };
+    let up = want.to_ascii_uppercase();
+    let matches: Vec<&String> = rings
+        .iter()
+        .filter(|r| r.0.to_ascii_uppercase() == up || r.0.to_ascii_uppercase().starts_with(&up))
+        .map(|r| &r.0)
+        .collect();
+    let exact = rings.iter().find(|r| r.0.to_ascii_uppercase() == up).map(|r| &r.0);
+    match exact.or(matches.first().map(|v| &**v)) {
+        Some(s) if exact.is_some() || matches.len() == 1 => Ok((*s).clone()),
+        _ if matches.is_empty() => Err(anyhow!("no registered ring matches {want}")),
+        _ => Err(anyhow!("{want} is ambiguous ({} rings match)", matches.len())),
+    }
+}
+
 /// Cached `build_summary`: recompute only when oura.db, profile.json, or
-/// feature_modes.json changes.
-fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
+/// feature_modes.json changes. Keyed per ring, so switching rings in the UI
+/// doesn't evict the other ring's build (a handful of rings at most).
+fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<Arc<Value>> {
     let _ = oura_store::storage::Store::migrate_if_writable(db);
+    let serial = resolve_summary_serial(db, serial)?;
     let token = summary_token(db);
-    if let Some(c) = summary_cache().lock().unwrap().as_ref() {
-        if c.db == db && c.tz == tz && c.token == token {
-            return Ok(c.value.clone());
-        }
+    if let Some(c) = summary_cache()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|c| c.db == db && c.tz == tz && c.serial == serial && c.token == token)
+    {
+        return Ok(c.value.clone());
     }
     // build outside the lock so concurrent first-loads don't serialise on it
-    let value = Arc::new(build_summary(db, tz)?);
+    let value = Arc::new(build_summary(db, tz, Some(&serial))?);
     // re-stat the inputs: if any changed while we were building (e.g. a sync landed),
     // the result may predate that change — don't cache it, so the next request
     // rebuilds against the new state instead of serving stale data.
@@ -349,12 +385,14 @@ fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
         // don't clobber a fresher entry a concurrent build already stored (compare
         // the DB mtime, which a sync advances)
         let newer_exists = guard
-            .as_ref()
-            .is_some_and(|c| c.db == db && c.tz == tz && c.token.0 > token.0);
+            .iter()
+            .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
         if !newer_exists {
-            *guard = Some(SummaryCache {
+            guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
+            guard.push(SummaryCache {
                 db: db.to_path_buf(),
                 tz,
+                serial,
                 token,
                 value: value.clone(),
             });
@@ -529,6 +567,7 @@ async fn handle(
         ("POST", "/api/profile")
             | ("POST", "/api/research-marker")
             | ("POST", "/api/bedtime")
+            | ("POST", "/api/rings")
             | ("POST", "/api/sync")
             | ("POST", "/api/live-hr")
             | ("POST", "/api/feature")
@@ -707,10 +746,45 @@ async fn handle(
                 .map_err(|e| anyhow!(e))?;
             json_resp(&mut sock, &v).await
         }
+        ("GET", "/api/rings") => {
+            // The switcher's data: every registered ring with its display name.
+            let v = match oura_store::storage::Store::open_read_only(&db).and_then(|s| s.list_rings()) {
+                Ok(rings) => Value::Array(
+                    rings
+                        .iter()
+                        .map(|(serial, name, note, _added, _seen, last_sync, _cursor, count)| {
+                            json!({
+                                "serial": serial, "name": name, "note": note,
+                                "last_sync": last_sync, "events": count,
+                            })
+                        })
+                        .collect(),
+                ),
+                Err(e) => json!({ "error": e.to_string() }),
+            };
+            json_resp(&mut sock, &v).await
+        }
+        ("POST", "/api/rings") => {
+            // Rename (and optionally annotate) a registered ring. The write bumps
+            // oura.db's mtime, which invalidates the summary cache on its own.
+            let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let serial = req["serial"].as_str().unwrap_or("");
+            let name = req["name"].as_str().unwrap_or("").trim();
+            let note = req["note"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            if serial.is_empty() || name.is_empty() {
+                return json_resp(&mut sock, &json!({ "ok": false, "error": "serial and name are required" })).await;
+            }
+            match oura_store::storage::Store::open(&db).and_then(|s| s.rename_ring(serial, name, note)) {
+                Ok(true) => json_resp(&mut sock, &json!({ "ok": true })).await,
+                Ok(false) => json_resp(&mut sock, &json!({ "ok": false, "error": format!("no ring registered with serial {serial}") })).await,
+                Err(e) => json_resp(&mut sock, &json!({ "ok": false, "error": e.to_string() })).await,
+            }
+        }
         ("GET", "/api/summary") => {
             // building the summary shells out to torch models → off the async
             // executor; cached so only the first load (or post-sync/edit) pays for it.
-            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz))
+            let serial = query_param(query, "serial");
+            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz, serial.as_deref()))
                 .await
                 .map_err(|e| anyhow!(e))?;
             match body {
@@ -727,8 +801,13 @@ async fn handle(
             let minutes = query_param(query, "minutes")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60);
+            let serial = query_param(query, "serial");
             let body = tokio::task::spawn_blocking(move || {
-                oura_summary::hourly_hr::hr_bins(&db, effective_tz, days, minutes)
+                let serial = serial
+                    .as_deref()
+                    .map(|s| resolve_summary_serial(&db, Some(s)))
+                    .transpose()?;
+                oura_summary::hourly_hr::hr_bins(&db, effective_tz, days, minutes, serial.as_deref())
             })
             .await
             .map_err(|e| anyhow!(e))?;
@@ -750,9 +829,14 @@ async fn handle(
                 .filter_map(oura_summary::research_export::Stream::from_id)
                 .collect();
             let tz = num("tz").unwrap_or(effective_tz);
+            let serial = query_param(query, "serial");
             let built = tokio::task::spawn_blocking(move || {
                 use oura_summary::research_export as rx;
-                let export = rx::build(&db, &rx::Request { start_unix: start, end_unix: end, streams, tz_offset_hours: tz })?;
+                let serial = serial
+                    .as_deref()
+                    .map(|s| resolve_summary_serial(&db, Some(s)))
+                    .transpose()?;
+                let export = rx::build(&db, &rx::Request { start_unix: start, end_unix: end, streams, tz_offset_hours: tz, serial })?;
                 let name = rx::bundle_name(start, tz);
                 Ok::<_, anyhow::Error>((rx::to_zip(&export, &name)?, name))
             })
@@ -772,15 +856,24 @@ async fn handle(
             }
         }
         ("POST", "/api/research-marker") => {
-            let label = serde_json::from_str::<Value>(body)
-                .ok()
+            let body_json = serde_json::from_str::<Value>(body).ok();
+            let label = body_json
+                .as_ref()
                 .and_then(|v| v["label"].as_str().map(str::to_owned))
                 .unwrap_or_default();
+            let serial = body_json
+                .as_ref()
+                .and_then(|v| v["serial"].as_str().map(str::to_owned));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as f64 / 1000.0)
                 .unwrap_or(0.0);
-            match oura_summary::research_export::add_marker(&db, now, &label) {
+            let serial = serial
+                .as_deref()
+                .map(|s| resolve_summary_serial(&db, Some(s)))
+                .transpose()
+                .map(|s| s.unwrap_or_default());
+            match serial.and_then(|s| oura_summary::research_export::add_marker(&db, now, &label, Some(&s))) {
                 Ok(()) => json_resp(&mut sock, &json!({ "ok": true, "unix": now })).await,
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
@@ -844,10 +937,31 @@ async fn handle(
             }
         }
         ("POST", "/api/sync") => {
-            let res =
-                tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
-                    .await
-                    .map_err(|e| anyhow!(e))?;
+            // Optional {"serial": "..."} targets one specific ring: rings advertise
+            // "Oura <serial>", so the name filter becomes an exact device pick, and
+            // the ring's own stored auth key (rings.auth_key_hex) beats --key-file.
+            let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let target = req["serial"].as_str().unwrap_or("").trim().to_string();
+            let name = if target.is_empty() { name.clone() } else { format!("Oura {target}") };
+            let key_file = if target.is_empty() {
+                key_file.clone()
+            } else {
+                match oura_store::storage::Store::open_read_only(&db)
+                    .and_then(|s| s.ring_key(&target))
+                {
+                    Ok(Some(hex)) => {
+                        let p = db.with_file_name(format!("ring-{target}.key"));
+                        match std::fs::write(&p, format!("{hex}\n")) {
+                            Ok(_) => Some(p),
+                            Err(_) => key_file.clone(),
+                        }
+                    }
+                    _ => key_file.clone(),
+                }
+            };
+            let res = tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
+                .await
+                .map_err(|e| anyhow!(e))?;
             let v = match res {
                 Ok(msg) => json!({ "ok": true, "message": msg }),
                 Err(e) => json!({ "ok": false, "message": e.to_string() }),

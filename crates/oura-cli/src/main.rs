@@ -193,6 +193,10 @@ enum Command {
         /// sleep_movement_30s, motion_30s, spo2_raw, skin_temperature.
         #[arg(long)]
         streams: Option<String>,
+        /// Only this ring's events (serial or unique serial prefix). Default: every
+        /// device in the DB — pass it once a second ring is registered.
+        #[arg(long)]
+        serial: Option<String>,
         /// UTC offset (hours) for parsing --start/--end and the local_time column.
         #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
         tz_offset: f64,
@@ -249,6 +253,19 @@ enum Command {
     },
     /// Read the real on-ring MODE/status of the data features (what's actually on).
     FeatureStatus,
+    /// List registered rings from the database (offline): names, serials, event
+    /// counts, last sync.
+    Rings,
+    /// Set a ring's display name in the registry (offline).
+    RingName {
+        /// Ring serial (see `oura rings`); a unique prefix is accepted.
+        serial: String,
+        /// New label, e.g. "Daily ring".
+        name: String,
+        /// Optional note (e.g. "banned by Oura").
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Serve a local web health dashboard (sleep, cardio, SpO2, activity, device)
     /// at http://127.0.0.1:PORT. Rust computes from oura.db; torch models run via
     /// the Python runners. All data stays on this machine.
@@ -308,6 +325,87 @@ fn feature_state_name(state: u8) -> &'static str {
         3 => "postprocessing",
         _ => "?",
     }
+}
+
+/// Resolve a user-supplied serial: exact match, else a unique case-insensitive
+/// prefix among registered rings.
+fn resolve_serial(db: &Path, want: &str) -> Result<String> {
+    let store = Store::open(db)?;
+    resolve_serial_in(&store, want)
+}
+
+fn resolve_serial_in(store: &Store, want: &str) -> Result<String> {
+    let rings = store.list_rings()?;
+    let want = want.to_ascii_uppercase();
+    if let Some(r) = rings.iter().find(|r| r.0.to_ascii_uppercase() == want) {
+        return Ok(r.0.clone());
+    }
+    let matches: Vec<&String> = rings
+        .iter()
+        .filter(|r| r.0.to_ascii_uppercase().starts_with(&want))
+        .map(|r| &r.0)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(anyhow!(
+            "no registered ring matches {want} — run `oura rings` to list them"
+        )),
+        n => Err(anyhow!(
+            "{want} is ambiguous ({n} rings match); give more of the serial"
+        )),
+    }
+}
+
+fn fmt_unix(ts: i64) -> String {
+    if ts <= 0 {
+        return "never".to_string();
+    }
+    let secs = ts as f64 / 86400.0;
+    let days = secs.floor() as i64;
+    // Civil-from-days (Howard Hinnant's algorithm) — no chrono dependency.
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = (secs.fract().abs() * 86400.0) as u64;
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
+fn cmd_rings(cli: &Cli) -> Result<()> {
+    let store = Store::open(&cli.db)?;
+    let rings = store.list_rings()?;
+    if rings.is_empty() {
+        println!("No rings registered yet — pair or sync one first.");
+        return Ok(());
+    }
+    println!("{:<17} {:<22} {:>9}  {:<17} {}", "SERIAL", "NAME", "EVENTS", "LAST SYNC", "NOTE");
+    for (serial, name, note, _added, _seen, last_sync, _cursor, count) in &rings {
+        println!(
+            "{:<17} {:<22} {:>9}  {:<17} {}",
+            serial,
+            name,
+            count,
+            fmt_unix(*last_sync),
+            note.clone().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_ring_name(cli: &Cli, serial: &str, name: &str, note: Option<&str>) -> Result<()> {
+    let store = Store::open(&cli.db)?;
+    let serial = resolve_serial_in(&store, serial)?;
+    if !store.rename_ring(&serial, name, note)? {
+        return Err(anyhow!("ring {serial} is not registered"));
+    }
+    println!("Renamed {serial} to \"{name}\".");
+    Ok(())
 }
 
 fn discover_key(db: &Path) -> Result<Option<PathBuf>> {
@@ -474,9 +572,18 @@ async fn main() -> Result<()> {
             start,
             end,
             streams,
+            serial,
             tz_offset,
             out,
-        } => cmd_research_export(&cli, start, end, streams.as_deref(), *tz_offset, out),
+        } => cmd_research_export(
+            &cli,
+            start,
+            end,
+            streams.as_deref(),
+            serial.as_deref(),
+            *tz_offset,
+            out,
+        ),
         Command::Redecode => {
             let store = Store::open(&cli.db)?;
             let (decoded, total) = store.redecode()?;
@@ -501,6 +608,8 @@ async fn main() -> Result<()> {
         Command::Subscribe { feature, mode } => cmd_subscribe(&cli, &key, feature, mode).await,
         Command::FeatureMode { feature, mode } => cmd_feature_mode(&cli, &key, feature, mode).await,
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
+        Command::Rings => cmd_rings(&cli),
+        Command::RingName { serial, name, note } => cmd_ring_name(&cli, serial, name, note.as_deref()),
         Command::Dashboard {
             port,
             lan,
@@ -1668,6 +1777,7 @@ fn cmd_research_export(
     start: &str,
     end: &str,
     streams: Option<&str>,
+    serial: Option<&str>,
     tz: f64,
     out: &std::path::Path,
 ) -> Result<()> {
@@ -1679,11 +1789,13 @@ fn cmd_research_export(
             .map(|id| Stream::from_id(id).ok_or_else(|| anyhow!("unknown stream {id:?}")))
             .collect::<Result<_>>()?,
     };
+    let serial = serial.map(|s| resolve_serial(&cli.db, s)).transpose()?;
     let req = rx::Request {
         start_unix: parse_local_time(start, tz)?,
         end_unix: parse_local_time(end, tz)?,
         streams,
         tz_offset_hours: tz,
+        serial,
     };
     let export = rx::build(&cli.db, &req)?;
     if out.extension().is_some_and(|e| e == "zip") {
