@@ -55,11 +55,14 @@ def civil(days):
     return (y + (1 if m <= 2 else 0), m, d)
 
 
-def load(db):
+def load(db, serial=None):
     con = sqlite3.connect(str(db))
     rows = con.execute(
         "SELECT ring_timestamp, tag, decoded_json, captured_unix FROM events "
-        "WHERE decoded_json IS NOT NULL ORDER BY captured_unix, id"
+        "WHERE decoded_json IS NOT NULL"
+        + (" AND serial = ?" if serial else "")
+        + " ORDER BY captured_unix, id",
+        (serial,) if serial else (),
     ).fetchall()
     con.close()
     return rows
@@ -200,8 +203,8 @@ def nz(a):
     return a[np.isfinite(a)]
 
 
-def run(db, tz, profile):
-    rows = load(db)
+def run(db, tz, profile, serial=None):
+    rows = load(db, serial)
     if not rows:
         return {"available": False, "status": "NO_DATA"}
     epochs = build_epochs(rows)
@@ -291,7 +294,10 @@ def run(db, tz, profile):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv = sys.argv[1:]
+    serial = argv[argv.index("--serial") + 1] if "--serial" in argv else None
+    drop = {"--serial", serial} if serial else {"--serial"}
+    args = [a for a in argv if not a.startswith("--") and a not in drop]
     profile = None
     if "--profile" in sys.argv:
         profile = sys.argv[sys.argv.index("--profile") + 1]
@@ -300,7 +306,7 @@ def main():
     if profile is None:
         pj = Path(db).resolve().parent / "profile.json"
         profile = str(pj) if pj.exists() else None
-    result = run(db, tz, profile)
+    result = run(db, tz, profile, serial)
     print(json.dumps(result, indent=None if "--json" in sys.argv else 2))
 
 

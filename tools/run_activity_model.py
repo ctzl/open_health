@@ -53,6 +53,7 @@ def parse_args():
                         help="Minimum segment minutes; Android default is 10")
     parser.add_argument("--date", help="Only process one local day (YYYY-MM-DD)")
     parser.add_argument("--no-stepmotion", action="store_true", help="Diagnostic fallback without gait")
+    parser.add_argument("--serial", default=None, help="Only this ring's events (multi-ring DBs).")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args, extra = parser.parse_known_args()
@@ -129,7 +130,7 @@ def load_step_decoder():
     return None
 
 
-def decode_stepmotion(db, unix_seconds, enabled, epochs):
+def decode_stepmotion(db, unix_seconds, enabled, epochs, serial=None):
     if not enabled:
         return []
     decoder = load_step_decoder()
@@ -140,7 +141,10 @@ def decode_stepmotion(db, unix_seconds, enabled, epochs):
         return []
     packets = db.execute(
         "SELECT ring_timestamp, tag, body, captured_unix FROM events "
-        "WHERE tag IN (126,127) AND body IS NOT NULL ORDER BY captured_unix,id"
+        "WHERE tag IN (126,127) AND body IS NOT NULL"
+        + (" AND serial = ?" if serial else "")
+        + " ORDER BY captured_unix,id",
+        (serial,) if serial else (),
     ).fetchall()
     seconds = {}
     for ds, tag, body, captured in packets:
@@ -223,7 +227,10 @@ def main():
     db = sqlite3.connect(str(db_path))
     rows = db.execute(
         "SELECT ring_timestamp,tag,decoded_json,captured_unix FROM events "
-        "WHERE decoded_json IS NOT NULL ORDER BY captured_unix,id"
+        "WHERE decoded_json IS NOT NULL"
+        + (" AND serial = ?" if args.serial else "")
+        + " ORDER BY captured_unix,id",
+        (args.serial,) if args.serial else (),
     ).fetchall()
     if not rows:
         sys.exit(f"error: no decoded events in {db_path}")
@@ -259,7 +266,7 @@ def main():
     if not signals["met"]:
         sys.exit("no MET events in DB — cannot run activity model")
 
-    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion, epochs)
+    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion, epochs, args.serial)
     # Demographics from profile.json next to the DB (what the iOS app and the CVA
     # runner use); the model takes [age, sex(M=1), height_m, weight_kg].
     profile = {}
