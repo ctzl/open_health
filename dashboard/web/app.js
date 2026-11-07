@@ -310,7 +310,7 @@ function dayCard(d, ymd) {
 // on its own and fills in when it arrives.
 let HR_QUARTER_LOAD = null;
 function fillDayHr(ymd, meta, strip) {
-  const request = HR_QUARTER_LOAD ||= fetch(`/api/hourly-hr?minutes=15&tz=${browserTzOffset()}`).then((r) => r.json());
+  const request = HR_QUARTER_LOAD ||= fetch(`/api/hourly-hr?minutes=15&tz=${browserTzOffset()}${ringQS()}`).then((r) => r.json());
   request
     .then((j) => {
       if (j.error) throw new Error(j.error);
@@ -1032,7 +1032,7 @@ function sleepSection(d, ymd, axis, cursor) {
           return;
         }
         toast(okMsg, "ok");
-        const fresh = await (await fetch(`/api/summary?tz=${browserTzOffset()}`)).json();
+        const fresh = await (await fetch(`/api/summary?tz=${browserTzOffset()}${ringQS()}`)).json();
         if (!fresh.error) {
           CURRENT_TZ = fresh.tz || 0;
           await load();
@@ -1349,7 +1349,7 @@ function heartSection(ymd, axis, cursor) {
     const seq = ++HR_SEQ; // a slower earlier response must not overwrite a newer one
     sw.querySelectorAll("button").forEach((b) => b.classList.toggle("on", +b.dataset.min === HR_BIN_MIN));
     chart.replaceChildren(el("div", "skeleton skeleton-block"));
-    fetch(`/api/hourly-hr?minutes=${HR_BIN_MIN}&tz=${browserTzOffset()}`)
+    fetch(`/api/hourly-hr?minutes=${HR_BIN_MIN}&tz=${browserTzOffset()}${ringQS()}`)
       .then((r) => r.json())
       .then((j) => {
         if (seq !== HR_SEQ) return;
@@ -1483,7 +1483,7 @@ async function doFeature(feature, name, currentOn, row) {
   row.classList.add("busy");
   row.classList.toggle("on", turnOn); // optimistic
   try {
-    const j = await (await postDash("/api/feature", { feature, mode: turnOn ? "automatic" : "off" })).json();
+    const j = await (await postDash("/api/feature", { feature, mode: turnOn ? "automatic" : "off", ...(CURRENT_SERIAL ? { serial: CURRENT_SERIAL } : {}) })).json();
     if (j.ok) {
       toast(`${name} turned ${turnOn ? "on" : "off"}. Wear the ring; data appears on the next sync.`, "ok");
       load(); // refresh dev.measuring so a second tap toggles from the real state
@@ -2094,7 +2094,7 @@ async function doSync() {
   $("sync-label").textContent = "Syncing";
   btn.title = "Connecting to the ring over Bluetooth…";
   try {
-    const j = await (await postDash("/api/sync")).json();
+    const j = await (await postDash("/api/sync", CURRENT_SERIAL ? { serial: CURRENT_SERIAL } : {})).json();
     if (j.ok) {
       $("sync-label").textContent = "Synced";
       toast(j.message && !/^synced$/i.test(j.message) ? j.message : "Ring synced.", "ok");
@@ -2144,7 +2144,7 @@ async function toggleLive() {
   status.textContent = "Connecting to the ring… keep your hand near the Mac (up to 2 min).";
   let end = null;
   try {
-    const r = await fetch("/api/live-hr", { method: "POST", headers: { ...DASH_HEADERS }, signal: abort.signal });
+    const r = await fetch("/api/live-hr", { method: "POST", headers: { ...DASH_HEADERS }, signal: abort.signal, body: CURRENT_SERIAL ? JSON.stringify({ serial: CURRENT_SERIAL }) : "" });
     if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
     const reader = r.body.getReader();
     const dec = new TextDecoder();
@@ -2204,7 +2204,7 @@ async function load() {
   const seq = ++LOAD_SEQ;
   let d;
   try {
-    d = await (await fetch(`/api/summary?tz=${browserTzOffset()}`)).json();
+    d = await (await fetch(`/api/summary?tz=${browserTzOffset()}${ringQS()}`)).json();
   } catch (e) {
     if (seq === LOAD_SEQ) showLoadError("Could not reach the local server.");
     return;
@@ -2235,11 +2235,96 @@ async function load() {
   });
 }
 
+// ── ring switcher ─────────────────────────────────────────
+// The dashboard shows one ring at a time; every data fetch carries ?serial=.
+// The choice persists in localStorage. On a single-ring DB the serial stays
+// null (the server auto-detects) and the switcher button stays hidden.
+let CURRENT_SERIAL = localStorage.getItem("oura-ring-serial") || null;
+let RINGS = [];
+const ringQS = () => (CURRENT_SERIAL ? `&serial=${encodeURIComponent(CURRENT_SERIAL)}` : "");
+const ringName = (serial) => {
+  const r = RINGS.find((x) => x.serial === serial);
+  return (r && r.name) || (serial ? "Ring " + String(serial).slice(-4) : "Ring");
+};
+function updateRingButton() {
+  const btn = $("ring-btn");
+  if (!btn) return;
+  btn.style.display = RINGS.length < 2 ? "none" : "";
+  if (RINGS.length >= 2) $("ring-label").textContent = ringName(CURRENT_SERIAL);
+}
+async function fetchRings() {
+  try {
+    const j = await (await fetch("/api/rings")).json();
+    if (Array.isArray(j)) RINGS = j;
+  } catch (_) { /* no registry yet; the switcher stays hidden */ }
+  updateRingButton();
+}
+function selectRing(serial) {
+  CURRENT_SERIAL = serial || null;
+  if (serial) localStorage.setItem("oura-ring-serial", serial);
+  else localStorage.removeItem("oura-ring-serial");
+  updateRingButton();
+}
+function openRings() {
+  const dlg = $("ring-dialog");
+  const list = $("ring-list");
+  list.innerHTML = "";
+  if (!RINGS.length) {
+    list.append(el("p", "dialog-sub", "No rings are registered in this database yet. Sync one first."));
+  }
+  RINGS.forEach((r) => {
+    const row = el("div", "ring-row" + (r.serial === CURRENT_SERIAL ? " sel" : ""));
+    const pick = el("button", "ring-pick");
+    pick.type = "button";
+    pick.append(el("div", "ring-name", esc(r.name)));
+    const meta = [];
+    if (r.note) meta.push(esc(r.note));
+    meta.push("•••" + String(r.serial).slice(-4));
+    meta.push((r.events || 0).toLocaleString() + " events");
+    if (r.last_sync) meta.push("synced " + new Date(r.last_sync * 1000).toLocaleString());
+    pick.append(el("div", "ring-meta", meta.join(" · ")));
+    pick.addEventListener("click", () => {
+      selectRing(r.serial);
+      dlg.close();
+      load();
+    });
+    row.append(pick);
+    const nameIn = el("input", "ring-rename");
+    nameIn.type = "text";
+    nameIn.value = r.name;
+    nameIn.maxLength = 40;
+    nameIn.setAttribute("aria-label", `Rename ${r.name}`);
+    const save = el("button", "btn-text", "Rename");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      const v = nameIn.value.trim();
+      if (!v || v === r.name) return;
+      try {
+        const j = await (await postDash("/api/rings", { serial: r.serial, name: v })).json();
+        if (j.ok) {
+          toast(`Renamed to “${v}”.`, "ok");
+          nameIn.value = v;
+          await fetchRings();
+        } else toast(j.error || "Rename failed.", "error");
+      } catch (e) {
+        toast("Rename failed: " + e.message, "error");
+      }
+    });
+    row.append(nameIn, save);
+    list.append(row);
+  });
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
+  dlg.showModal();
+}
+
 $("sync-btn").addEventListener("click", doSync);
 $("live-btn").addEventListener("click", toggleLive);
+$("ring-btn").addEventListener("click", openRings);
+$("ring-cancel").addEventListener("click", () => $("ring-dialog").close());
 $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
+fetchRings();
 load();
 
 // ── research export: raw CSVs for a window, built by oura-summary::research_export ──
@@ -2264,6 +2349,7 @@ load();
       start: String(s.getTime() / 1000), end: String(t.getTime() / 1000),
       streams: streams.join(","), tz: String(-s.getTimezoneOffset() / 60),
     });
+    if (CURRENT_SERIAL) q.set("serial", CURRENT_SERIAL);
     const a = document.createElement("a");
     a.href = `/api/research-export?${q}`;
     document.body.append(a); a.click(); a.remove();
@@ -2275,7 +2361,7 @@ load();
     try {
       const r = await fetch("/api/research-marker", {
         method: "POST", headers: { "Content-Type": "application/json", "X-Oura-Dash": "1" },
-        body: JSON.stringify({ label }),
+        body: JSON.stringify({ label, ...(CURRENT_SERIAL ? { serial: CURRENT_SERIAL } : {}) }),
       });
       const j = await r.json();
       if (j.error) throw new Error(j.error);
