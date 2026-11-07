@@ -2120,7 +2120,7 @@ let LIVE_ABORT = null;
 function liveHint(msg) {
   msg = msg || "";
   if (/no matching|not found|no device|no ring/i.test(msg))
-    return "Couldn't find your ring. Keep it on your finger, close to the Mac, and try again.";
+    return "Couldn't find your ring. Keep it on your finger, close to the computer, and try again.";
   if (/key|auth|unauthor/i.test(msg))
     return "The ring needs its auth key. Start the dashboard with --key-file.";
   return "Live heart rate failed: " + msg;
@@ -2141,7 +2141,7 @@ async function toggleLive() {
   $("live-label").textContent = "Stop";
   $("live-bpm").textContent = "—";
   $("live-spark").innerHTML = "";
-  status.textContent = "Connecting to the ring… keep your hand near the Mac (up to 2 min).";
+  status.textContent = "Connecting to the ring… keep your hand near the computer (up to 2 min).";
   let end = null;
   try {
     const r = await fetch("/api/live-hr", { method: "POST", headers: { ...DASH_HEADERS }, signal: abort.signal, body: CURRENT_SERIAL ? JSON.stringify({ serial: CURRENT_SERIAL }) : "" });
