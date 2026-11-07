@@ -19,6 +19,10 @@
         </span>
       </div>
       <div class="actions">
+        <button id="ring-btn" class="action" title="Switch or rename rings">
+          <span class="ic" style="--i:url(/icons/ring.svg)"></span>
+          <span id="ring-label">Ring</span>
+        </button>
         <span id="batt" class="batt" title="Ring battery"></span>
         <button id="sync-btn" class="action" title="Sync the ring over Bluetooth">
           <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
@@ -143,6 +147,17 @@
   </div>
 
   <!-- profile editor -->
+  <dialog id="ring-dialog" class="dialog">
+    <form id="ring-form" method="dialog">
+      <h3>Rings</h3>
+      <p class="dialog-sub">Pick which ring the dashboard shows. Everything below — charts, nights, exports — is filtered to that ring's serial. Rename a ring to tell them apart.</p>
+      <div id="ring-list" class="ring-list"></div>
+      <div class="dialog-actions">
+        <button type="button" id="ring-cancel" class="btn-text">Close</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="profile-dialog" class="dialog">
     <form id="profile-form" method="dialog">
       <h3>Your details</h3>

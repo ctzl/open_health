@@ -937,28 +937,10 @@ async fn handle(
             }
         }
         ("POST", "/api/sync") => {
-            // Optional {"serial": "..."} targets one specific ring: rings advertise
-            // "Oura <serial>", so the name filter becomes an exact device pick, and
-            // the ring's own stored auth key (rings.auth_key_hex) beats --key-file.
+            // Optional {"serial": "..."} targets one specific ring (see resolve_ring_target).
             let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let target = req["serial"].as_str().unwrap_or("").trim().to_string();
-            let name = if target.is_empty() { name.clone() } else { format!("Oura {target}") };
-            let key_file = if target.is_empty() {
-                key_file.clone()
-            } else {
-                match oura_store::storage::Store::open_read_only(&db)
-                    .and_then(|s| s.ring_key(&target))
-                {
-                    Ok(Some(hex)) => {
-                        let p = db.with_file_name(format!("ring-{target}.key"));
-                        match std::fs::write(&p, format!("{hex}\n")) {
-                            Ok(_) => Some(p),
-                            Err(_) => key_file.clone(),
-                        }
-                    }
-                    _ => key_file.clone(),
-                }
-            };
+            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
             let res = tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
                 .await
                 .map_err(|e| anyhow!(e))?;
@@ -968,12 +950,20 @@ async fn handle(
             };
             json_resp(&mut sock, &v).await
         }
-        ("POST", "/api/live-hr") => live_hr(&mut sock, &db, &name, key_file.as_deref()).await,
+        ("POST", "/api/live-hr") => {
+            // Same per-ring targeting as /api/sync (name filter + stored key).
+            let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let target = req["serial"].as_str().unwrap_or("").trim().to_string();
+            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
+            live_hr(&mut sock, &db, &name, key_file.as_deref()).await
+        }
         ("POST", "/api/feature") => {
             let req =
                 serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let feature = req["feature"].as_str().unwrap_or("").to_string();
             let mode = req["mode"].as_str().unwrap_or("").to_string();
+            let target = req["serial"].as_str().unwrap_or("").trim().to_string();
+            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
             let res = tokio::task::spawn_blocking(move || {
                 run_feature(&db, &name, key_file.as_deref(), &feature, &mode)
             })
@@ -987,6 +977,33 @@ async fn handle(
         }
         _ => write_resp(&mut sock, "404 Not Found", "text/plain", b"not found").await,
     }
+}
+
+/// BLE targeting for a dashboard action. With a serial, the scan name becomes the
+/// ring's advertised "Oura <serial>" (an exact pick) and its stored auth key
+/// (rings.auth_key_hex) beats the global --key-file; without one, the CLI defaults
+/// stand. The stored key is written to a sibling file because `oura` takes a path.
+fn resolve_ring_target(
+    db: &Path,
+    serial: &str,
+    default_name: &str,
+    default_key: Option<&Path>,
+) -> (String, Option<PathBuf>) {
+    if serial.is_empty() {
+        return (default_name.to_string(), default_key.map(PathBuf::from));
+    }
+    let key = match oura_store::storage::Store::open_read_only(db).and_then(|s| s.ring_key(serial)) {
+        Ok(Some(hex)) => {
+            let p = db.with_file_name(format!("ring-{serial}.key"));
+            if std::fs::write(&p, format!("{hex}\n")).is_ok() {
+                Some(p)
+            } else {
+                default_key.map(PathBuf::from)
+            }
+        }
+        _ => default_key.map(PathBuf::from),
+    };
+    (format!("Oura {serial}"), key)
 }
 
 /// Drain the ring by invoking our own binary's `sync` subcommand (reuses all the
