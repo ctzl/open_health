@@ -2237,9 +2237,13 @@ async function load() {
 
 // ── ring switcher ─────────────────────────────────────────
 // The dashboard shows one ring at a time; every data fetch carries ?serial=.
-// The choice persists in localStorage. On a single-ring DB the serial stays
-// null (the server auto-detects) and the switcher button stays hidden.
-let CURRENT_SERIAL = localStorage.getItem("oura-ring-serial") || null;
+// The choice persists in a cookie (sent to the server with every request, so the
+// server can also honour it). On a single-ring DB the serial stays null (the
+// server auto-detects) and the switcher button stays hidden.
+const RING_COOKIE = "oura_ring";
+const readRingCookie = () =>
+  document.cookie.split(/;\s*/).find((c) => c.startsWith(RING_COOKIE + "="))?.slice(RING_COOKIE.length + 1) || null;
+let CURRENT_SERIAL = readRingCookie();
 let RINGS = [];
 const ringQS = () => (CURRENT_SERIAL ? `&serial=${encodeURIComponent(CURRENT_SERIAL)}` : "");
 const ringName = (serial) => {
@@ -2257,12 +2261,18 @@ async function fetchRings() {
     const j = await (await fetch("/api/rings")).json();
     if (Array.isArray(j)) RINGS = j;
   } catch (_) { /* no registry yet; the switcher stays hidden */ }
+  // No cookie — or one naming a ring that no longer exists: default to the first
+  // ring alphabetically by name, and persist that choice.
+  if (RINGS.length && (!CURRENT_SERIAL || !RINGS.some((r) => r.serial === CURRENT_SERIAL))) {
+    const first = [...RINGS].sort((a, b) => a.name.localeCompare(b.name))[0];
+    selectRing(first.serial);
+  }
   updateRingButton();
 }
 function selectRing(serial) {
   CURRENT_SERIAL = serial || null;
-  if (serial) localStorage.setItem("oura-ring-serial", serial);
-  else localStorage.removeItem("oura-ring-serial");
+  // one-year cookie scoped to this host; clearing = expire immediately
+  document.cookie = `${RING_COOKIE}=${encodeURIComponent(serial || "")}; path=/; max-age=${serial ? 31536000 : 0}; SameSite=Lax`;
   updateRingButton();
 }
 function openRings() {
@@ -2324,8 +2334,8 @@ $("ring-cancel").addEventListener("click", () => $("ring-dialog").close());
 $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
-fetchRings();
-load();
+// pick the ring first (cookie or alphabetical default) so the first load is filtered
+fetchRings().finally(load);
 
 // ── research export: raw CSVs for a window, built by oura-summary::research_export ──
 (function researchExport() {
