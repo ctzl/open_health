@@ -1088,10 +1088,12 @@ function sleepSection(d, ymd, axis, cursor) {
   const W = 1000, a = axis.frac(n.start_unix), b = axis.frac(n.end_unix);
   const rows = [];
   if (staged && n.stages_5min && n.stages_5min.length) {
-    // What the official Oura app draws: the same stages in 5-minute blocks, laid
-    // from the first NSSA epoch (floor of bedtime start to the 30 s grid).
-    const st5 = n.stages_5min, t0 = n.stages_t0_unix || n.start_unix;
-    const a5 = axis.frac(t0), b5 = axis.frac(t0 + st5.length * 300);
+    // What the official Oura app draws: the same stages in 5-minute blocks. The
+    // server aggregates these from `stages_full`, so they share its grid and its
+    // anchor (start_unix) — NOT stages_t0_unix, which is the first raw NSSA epoch
+    // and can sit minutes into the window; anchoring on it slid this row right.
+    const st5 = n.stages_5min;
+    const a5 = a, b5 = axis.frac(n.start_unix + st5.length * 300);
     rows.push({
       label: "Stages · 5 min (Oura app)", summary: "", height: 96, html: hypnoSvg(st5, W, 92, [a5, b5]),
       valueAt: (t) => {
