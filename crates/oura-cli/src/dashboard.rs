@@ -940,8 +940,10 @@ async fn handle(
             // Optional {"serial": "..."} targets one specific ring (see resolve_ring_target).
             let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let target = req["serial"].as_str().unwrap_or("").trim().to_string();
-            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
-            let res = tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
+            let (serial, key_file) = resolve_ring_target(&db, &target, key_file.as_deref());
+            let res = tokio::task::spawn_blocking(move || {
+                run_sync(&db, &name, &serial, key_file.as_deref())
+            })
                 .await
                 .map_err(|e| anyhow!(e))?;
             let v = match res {
@@ -954,8 +956,8 @@ async fn handle(
             // Same per-ring targeting as /api/sync (name filter + stored key).
             let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let target = req["serial"].as_str().unwrap_or("").trim().to_string();
-            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
-            live_hr(&mut sock, &db, &name, key_file.as_deref()).await
+            let (serial, key_file) = resolve_ring_target(&db, &target, key_file.as_deref());
+            live_hr(&mut sock, &db, &name, &serial, key_file.as_deref()).await
         }
         ("POST", "/api/feature") => {
             let req =
@@ -963,9 +965,9 @@ async fn handle(
             let feature = req["feature"].as_str().unwrap_or("").to_string();
             let mode = req["mode"].as_str().unwrap_or("").to_string();
             let target = req["serial"].as_str().unwrap_or("").trim().to_string();
-            let (name, key_file) = resolve_ring_target(&db, &target, &name, key_file.as_deref());
+            let (serial, key_file) = resolve_ring_target(&db, &target, key_file.as_deref());
             let res = tokio::task::spawn_blocking(move || {
-                run_feature(&db, &name, key_file.as_deref(), &feature, &mode)
+                run_feature(&db, &name, &serial, key_file.as_deref(), &feature, &mode)
             })
             .await
             .map_err(|e| anyhow!(e))?;
@@ -979,18 +981,19 @@ async fn handle(
     }
 }
 
-/// BLE targeting for a dashboard action. With a serial, the scan name becomes the
-/// ring's advertised "Oura <serial>" (an exact pick) and its stored auth key
-/// (rings.auth_key_hex) beats the global --key-file; without one, the CLI defaults
-/// stand. The stored key is written to a sibling file because `oura` takes a path.
+/// BLE targeting for a dashboard action. With a serial, the CLI gets
+/// `--expect-serial` (advertisements carry no serial or stable address, so the
+/// CLI probes candidates and verifies the serial over GATT) and the ring's
+/// stored auth key (rings.auth_key_hex) beats the global --key-file; without
+/// one, the CLI defaults stand. The stored key is written to a sibling file
+/// because `oura` takes a path.
 fn resolve_ring_target(
     db: &Path,
     serial: &str,
-    default_name: &str,
     default_key: Option<&Path>,
 ) -> (String, Option<PathBuf>) {
     if serial.is_empty() {
-        return (default_name.to_string(), default_key.map(PathBuf::from));
+        return (String::new(), default_key.map(PathBuf::from));
     }
     let key = match oura_store::storage::Store::open_read_only(db).and_then(|s| s.ring_key(serial)) {
         Ok(Some(hex)) => {
@@ -1003,7 +1006,17 @@ fn resolve_ring_target(
         }
         _ => default_key.map(PathBuf::from),
     };
-    (format!("Oura {serial}"), key)
+    (serial.to_string(), key)
+}
+
+/// BLE targeting flags for a CLI child: prefer `--expect-serial` (verified over
+/// GATT) when a serial is known, else the legacy `--name` filter.
+fn target_args(c: &mut Command, name: &str, serial: &str) {
+    if serial.is_empty() {
+        c.arg("--name").arg(name);
+    } else {
+        c.arg("--expect-serial").arg(serial);
+    }
 }
 
 /// Drain the ring by invoking our own binary's `sync` subcommand (reuses all the
@@ -1013,16 +1026,14 @@ fn resolve_ring_target(
 /// all for a few seconds after a disconnect), so a single short scan often misses a
 /// ring that is right there. We use a longer scan window and retry the transient
 /// "no matching ring" miss a couple of times before giving up.
-fn run_sync(db: &Path, name: &str, key_file: Option<&Path>) -> Result<String> {
+fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Result<String> {
     let exe = std::env::current_exe().context("locating oura binary")?;
     let mut last = String::from("sync failed");
     for attempt in 0..3 {
         let mut c = Command::new(&exe);
-        c.arg("--db")
-            .arg(db)
-            .arg("--name")
-            .arg(name)
-            .arg("--scan-timeout")
+        c.arg("--db").arg(db);
+        target_args(&mut c, name, serial);
+        c.arg("--scan-timeout")
             .arg("40"); // global flag; wider than the 25 s default
         if let Some(k) = key_file {
             c.arg("--key-file").arg(k);
@@ -1069,6 +1080,7 @@ async fn live_hr(
     sock: &mut TcpStream,
     db: &Path,
     name: &str,
+    serial: &str,
     key_file: Option<&Path>,
 ) -> Result<()> {
     sock.write_all(
@@ -1081,11 +1093,14 @@ async fn live_hr(
         return send_line(&mut wr, &json!({ "error": msg })).await;
     };
     let exe = std::env::current_exe().context("locating oura binary")?;
-    let mut child = tokio::process::Command::new(&exe)
-        .arg("--db")
-        .arg(db)
-        .arg("--name")
-        .arg(name)
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("--db").arg(db);
+    if serial.is_empty() {
+        cmd.arg("--name").arg(name);
+    } else {
+        cmd.arg("--expect-serial").arg(serial);
+    }
+    let mut child = cmd
         .arg("--scan-timeout")
         .arg("120") // a worn ring advertises only in sparse bursts
         .arg("--key-file")
@@ -1183,6 +1198,7 @@ fn parse_beat_line(line: &str) -> Option<(u16, u16)> {
 fn run_feature(
     db: &Path,
     name: &str,
+    serial: &str,
     key_file: Option<&Path>,
     feature: &str,
     mode: &str,
@@ -1210,11 +1226,9 @@ fn run_feature(
     let mut last = String::from("toggle failed");
     for attempt in 0..3 {
         let mut c = Command::new(&exe);
-        c.arg("--db")
-            .arg(db)
-            .arg("--name")
-            .arg(name)
-            .arg("--scan-timeout")
+        c.arg("--db").arg(db);
+        target_args(&mut c, name, serial);
+        c.arg("--scan-timeout")
             .arg("40")
             .arg("--key-file")
             .arg(key_file)

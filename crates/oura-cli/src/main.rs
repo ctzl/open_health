@@ -68,6 +68,14 @@ struct Cli {
     #[arg(long, global = true)]
     address: Option<String>,
 
+    /// Connect only to the ring whose GATT serial matches (case-insensitive).
+    /// Advertisements carry neither the serial nor a stable address, so this
+    /// scans all Oura rings, connects strongest-first, and reads the serial
+    /// over GATT until one matches. The only reliable way to target one ring
+    /// when several exist.
+    #[arg(long, global = true)]
+    expect_serial: Option<String>,
+
     /// Seconds to scan before giving up.
     #[arg(long, global = true, default_value_t = 25)]
     scan_timeout: u64,
@@ -491,6 +499,9 @@ fn open_store_or_warn(db: &Path) -> Option<Store> {
 }
 
 async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
+    if let Some(serial) = cli.expect_serial.as_deref() {
+        return connect_by_serial(serial, Duration::from_secs(cli.scan_timeout)).await;
+    }
     let transport = BleTransport::connect(
         &cli.name,
         cli.address.as_deref(),
@@ -499,6 +510,39 @@ async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
     .await
     .context("connecting to ring")?;
     Ok(OuraClient::new(transport))
+}
+
+/// Connect to the ring with this exact serial: scan every Oura advertiser,
+/// connect strongest-first, read the serial over GATT (readable without auth),
+/// and keep the match. "no matching" wording keeps callers' transient-retry
+/// logic working.
+async fn connect_by_serial(serial: &str, scan_timeout: Duration) -> Result<OuraClient<BleTransport>> {
+    let candidates = ble::scan_peripherals(scan_timeout)
+        .await
+        .context("scanning for Oura rings")?;
+    let mut last = format!("no matching Oura ring found advertising for serial {serial}");
+    for (p, _rssi) in candidates {
+        let transport = match BleTransport::setup(p).await {
+            Ok(t) => t,
+            Err(e) => {
+                last = format!("could not open a GATT link to a candidate ring: {e}");
+                continue;
+            }
+        };
+        let client = OuraClient::new(transport);
+        match client.serial().await {
+            Ok(got) if got.eq_ignore_ascii_case(serial) => return Ok(client),
+            Ok(got) => {
+                let _ = client.transport().disconnect().await;
+                last = format!("connected to ring {got}, not {serial}");
+            }
+            Err(e) => {
+                let _ = client.transport().disconnect().await;
+                last = format!("connected to a ring but could not read its serial: {e}");
+            }
+        }
+    }
+    Err(anyhow!("{last}"))
 }
 
 /// Authenticate if a key was supplied; returns whether auth was performed.
