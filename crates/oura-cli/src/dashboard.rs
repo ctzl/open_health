@@ -59,17 +59,55 @@ fn write_ring_key(path: Option<&Path>, key: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Activity log — an in-memory ring of what the dashboard just did (syncs,
-// torch model runs, live-HR sessions, feature toggles), surfaced on /logs.
-// Deliberately not persisted: it answers "what just happened and why did it
-// fail", and durable progress already lives in the sync cursor.
+// Activity log — a ring of what the dashboard did (syncs, torch model runs,
+// live-HR sessions, feature toggles), surfaced on /logs. Persisted as JSONL
+// next to the DB (same sidecar convention as profile.json) and replayed into
+// the in-memory ring on startup, so history survives restarts. The file is
+// bounded: once it passes LOG_FILE_MAX_BYTES it is rewritten from the ring.
 // ---------------------------------------------------------------------------
 
 const ACTIVITY_MAX: usize = 400;
+const LOG_FILE_MAX_BYTES: u64 = 2_000_000;
 
 fn activity_log() -> &'static Mutex<std::collections::VecDeque<Value>> {
     static LOG: OnceLock<Mutex<std::collections::VecDeque<Value>>> = OnceLock::new();
     LOG.get_or_init(Default::default)
+}
+
+/// JSONL sidecar path; set once by `serve()` via `init_activity_log`. Tests run without one.
+fn activity_log_slot() -> &'static OnceLock<Option<PathBuf>> {
+    static P: OnceLock<OnceLock<Option<PathBuf>>> = OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+fn activity_log_path() -> Option<&'static PathBuf> {
+    activity_log_slot().get_or_init(|| None).as_ref()
+}
+
+fn activity_log_file(db: &Path) -> PathBuf {
+    db.parent()
+        .unwrap_or(Path::new("."))
+        .join("activity_log.jsonl")
+}
+
+/// Point the log at `db`'s sidecar and replay its tail into the ring.
+fn init_activity_log(db: &Path) {
+    let path = activity_log_file(db);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let log = activity_log();
+        let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+        for line in text.lines() {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if v["ts"].is_number() && v["kind"].is_string() {
+                    log.push_back(v);
+                }
+            }
+        }
+        while log.len() > ACTIVITY_MAX {
+            log.pop_front();
+        }
+    }
+    let _ = activity_log_slot().set(Some(path));
 }
 
 /// Trim to `max` chars, marking the cut — log details must never blow up the page.
@@ -88,10 +126,39 @@ fn log_activity(kind: &str, status: &str, detail: &str) {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     tracing::info!("[activity:{kind}] {status}: {}", detail.replace('\n', " | "));
+    let entry = json!({ "ts": ts, "kind": kind, "status": status, "detail": detail });
     let mut log = activity_log().lock().unwrap_or_else(|e| e.into_inner());
-    log.push_back(json!({ "ts": ts, "kind": kind, "status": status, "detail": detail }));
+    log.push_back(entry.clone());
     while log.len() > ACTIVITY_MAX {
         log.pop_front();
+    }
+    // Persist after the in-memory insert: the ring is the source of truth and
+    // the file is rebuilt from it whenever it grows past the byte cap.
+    if let Some(path) = activity_log_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+            let oversized = f
+                .metadata()
+                .map(|m| m.len() > LOG_FILE_MAX_BYTES)
+                .unwrap_or(false);
+            if oversized {
+                drop(f);
+                if let Ok(text) = std::fs::write(
+                    path,
+                    log.iter()
+                        .map(|e| format!("{}\n", serde_json::to_string(e).unwrap_or_default()))
+                        .collect::<String>()
+                        .as_bytes(),
+                ) {
+                    let _ = text;
+                }
+            }
+        }
     }
 }
 
@@ -111,6 +178,9 @@ fn clear_activity() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    if let Some(path) = activity_log_path() {
+        let _ = std::fs::write(path, "");
+    }
 }
 
 fn validate_ring_key(key: &str) -> Result<String> {
@@ -516,6 +586,8 @@ pub async fn serve(
     if !profile_path(&db).exists() {
         let _ = write_profile(&db, &seed.to_json());
     }
+    // replay the persisted activity log (activity_log.jsonl next to the DB)
+    init_activity_log(&db);
     let bind_ip = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let listener = TcpListener::bind((bind_ip, port))
         .await
@@ -820,8 +892,9 @@ async fn handle(
             .await
         }
         ("GET", "/api/logs") => {
-            // The /logs page's feed: in-memory activity ring (syncs, model runs,
-            // live-HR, feature toggles), newest first. `kind` filters; `limit` caps.
+            // The /logs page's feed: activity ring (syncs, model runs, live-HR,
+            // feature toggles; persisted to activity_log.jsonl), newest first.
+            // `kind` filters; `limit` caps.
             let kind = query_param(query, "kind").unwrap_or_default();
             let limit = query_param(query, "limit")
                 .and_then(|v| v.parse::<usize>().ok())

@@ -26,10 +26,10 @@
     </header>
 
     <p class="digest">
-      What the dashboard just did: every sync (with the ring's own output), every torch model run
+      What the dashboard did: every sync (with the ring's own output), every torch model run
       (duration, failures with the Python stderr), live heart-rate sessions, and feature toggles.
-      The log lives in the dashboard's memory — it answers "what just happened and why did it fail";
-      durable progress lives in the sync cursor.
+      The log persists to <code>activity_log.jsonl</code> next to the database and survives restarts;
+      the page shows the most recent 400 entries.
     </p>
 
     <section class="panel" id="log-panel">
