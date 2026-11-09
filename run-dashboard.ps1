@@ -3,14 +3,10 @@
 # open_oura checkout. All data stays on this machine.
 #
 # Usage:
-#   .
-un-dashboard.ps1                 # normal start (localhost only)
-#   .
-un-dashboard.ps1 -Lan            # also reachable from other LAN devices
-#   .
-un-dashboard.ps1 -Build          # rebuild the binary first
-#   .
-un-dashboard.ps1 -Port 8095      # alternate port
+#   .\run-dashboard.ps1              # normal start (localhost only)
+#   .\run-dashboard.ps1 -Lan         # also reachable from other LAN devices
+#   .\run-dashboard.ps1 -Build       # rebuild the binary first
+#   .\run-dashboard.ps1 -Port 8095   # alternate port
 
 param(
     [switch]$Build,
@@ -40,7 +36,7 @@ if ($Build) {
 }
 
 if (-not (Test-Path $exe)) {
-    Write-Error "oura.exe not built yet. Run: .\run-dashboard.ps1 -Build"
+    Write-Error "oura.exe not built yet. Run: .\un-dashboard.ps1 -Build"
     exit 1
 }
 
