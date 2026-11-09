@@ -93,6 +93,7 @@ pub struct ModelOutputs {
     pub cva: Option<Value>,         // run_cva_model.py
     pub activity: Option<Value>,    // run_activity_model.py
     pub illness: Option<Value>,     // run_illness_model.py (Symptom Radar)
+    pub stress: Option<Value>,      // run_stress_events.py (stress/rest event chain)
 }
 
 /// Runs the torch models. `oura-cli` shells out to Python; the native client runs
@@ -2454,6 +2455,7 @@ pub fn build_summary(
         cva,
         activity: activity_raw,
         illness,
+        stress,
     } = runner.run(ModelInputs {
         db,
         tz,
@@ -3155,6 +3157,7 @@ pub fn build_summary(
         // IllnessResult so one card renders either source.
         "symptoms": symptoms,
         "illness": illness,
+        "stress": stress,
         "cardio": cva,
         "fitness": { "vo2max": (vo2max * 10.0).round() / 10.0 },
         "activity": activity,

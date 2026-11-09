@@ -503,6 +503,48 @@ function renderIllness(d) {
   box.append(el("div", "il-foot", `${basis} · ${esc(ill.date)}`));
 }
 
+// Stress & restored events: the local DSA chain (stress_daytime_sensing ->
+// astd_event_detection). The runner classifies 15-min bins against the wearer's
+// own daytime-HRV baseline; an event = 4 consecutive qualifying bins. Needs
+// daytime_hr captures, so it is empty until that feature has run.
+function renderStress(d) {
+  const box = $("stress");
+  box.innerHTML = "";
+  const st = d.stress;
+  if (!st || !Array.isArray(st.days)) {
+    box.append(el("div", "error",
+      "Stress events need daytime HRV — enable the daytime_hr feature, wear the ring while awake, then sync. " +
+      "(Also needs the stress model runner: Python + tools/run_stress_events.py.)"));
+    return;
+  }
+  const days = st.days.filter((x) => !x.error);
+  const events = days.flatMap((x) => (x.events || []).map((e) => ({ ...e, day: x.day })));
+  const samples = days.reduce((a, x) => a + (x.n_samples || 0), 0);
+  if (!samples) {
+    box.append(el("div", "error", "No qualifying daytime HRV samples yet — the model only accepts awake, sedentary readings."));
+    return;
+  }
+  const kvs = el("div", "kvs");
+  kvs.append(el("div", "kv", `<div class="k">Stress events</div><div class="v">${events.filter((e) => e.type === "stressed").length}</div>`));
+  kvs.append(el("div", "kv", `<div class="k">Restored events</div><div class="v">${events.filter((e) => e.type === "restored").length}</div>`));
+  kvs.append(el("div", "kv", `<div class="k">Daytime samples</div><div class="v">${samples} over ${days.length} days</div>`));
+  box.append(kvs);
+  if (!events.length) {
+    box.append(el("p", "il-copy", "No stress or restored events detected — the day's HRV stayed inside your neutral zone."));
+  } else {
+    const list = el("div", "il-biomarkers");
+    for (const e of events.slice(-12).reverse()) {
+      list.append(el("div", `il-bm il-${e.type === "stressed" ? "up" : "down"}`,
+        `<span class="il-bm-name">${e.type === "stressed" ? "Stressed" : "Restored"} · ${esc(e.start_local)} → ${esc(e.end_local)}</span>` +
+        `<span class="il-bm-val">${e.duration_min} min</span>`));
+    }
+    box.append(list);
+  }
+  const b = st.stress_baseline || {};
+  box.append(el("div", "il-foot",
+    `astd_event_detection on local DSA series · night HRV baseline ${b.night_hrv_baseline ?? "—"} ms · dHRV baseline ${b.dhrv_baseline ?? "—"} ms`));
+}
+
 function renderCardio(d) {
   const box = $("cardio");
   const cv = d.cardio;
@@ -2226,6 +2268,7 @@ async function load() {
   renderDay(d);
   renderSleepDebt(d);
   renderIllness(d);
+  renderStress(d);
   renderCardio(d);
   renderSpo2(d);
   renderDevice(d);
