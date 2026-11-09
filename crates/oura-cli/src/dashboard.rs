@@ -34,6 +34,9 @@ const DNA_CSS: &str = include_str!("../../../dashboard/web/dna.css");
 const BLOOD_HTML: &str = include_str!("../../../dashboard/web/blood.html");
 const BLOOD_JS: &str = include_str!("../../../dashboard/web/blood.js");
 const BLOOD_CSS: &str = include_str!("../../../dashboard/web/blood.css");
+const LOGS_HTML: &str = include_str!("../../../dashboard/web/logs.html");
+const LOGS_JS: &str = include_str!("../../../dashboard/web/logs.js");
+const LOGS_CSS: &str = include_str!("../../../dashboard/web/logs.css");
 
 fn read_ring_key(path: Option<&Path>) -> Result<String> {
     let path = path.ok_or_else(|| anyhow!("dashboard was started without --key-file"))?;
@@ -53,6 +56,61 @@ fn write_ring_key(path: Option<&Path>, key: &str) -> Result<String> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// Activity log — an in-memory ring of what the dashboard just did (syncs,
+// torch model runs, live-HR sessions, feature toggles), surfaced on /logs.
+// Deliberately not persisted: it answers "what just happened and why did it
+// fail", and durable progress already lives in the sync cursor.
+// ---------------------------------------------------------------------------
+
+const ACTIVITY_MAX: usize = 400;
+
+fn activity_log() -> &'static Mutex<std::collections::VecDeque<Value>> {
+    static LOG: OnceLock<Mutex<std::collections::VecDeque<Value>>> = OnceLock::new();
+    LOG.get_or_init(Default::default)
+}
+
+/// Trim to `max` chars, marking the cut — log details must never blow up the page.
+fn clip(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}… (truncated)")
+}
+
+fn log_activity(kind: &str, status: &str, detail: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    tracing::info!("[activity:{kind}] {status}: {}", detail.replace('\n', " | "));
+    let mut log = activity_log().lock().unwrap_or_else(|e| e.into_inner());
+    log.push_back(json!({ "ts": ts, "kind": kind, "status": status, "detail": detail }));
+    while log.len() > ACTIVITY_MAX {
+        log.pop_front();
+    }
+}
+
+/// Newest-first entries, optionally filtered by kind, capped at `limit`.
+fn list_activity(kind: &str, limit: usize) -> Vec<Value> {
+    let log = activity_log().lock().unwrap_or_else(|e| e.into_inner());
+    log.iter()
+        .rev()
+        .filter(|e| kind.is_empty() || e["kind"].as_str() == Some(kind))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+fn clear_activity() {
+    activity_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 fn validate_ring_key(key: &str) -> Result<String> {
@@ -78,6 +136,7 @@ fn model_output(
     mut command: Command,
     input: Option<&[u8]>,
     timeout: std::time::Duration,
+    label: &str,
 ) -> Option<Value> {
     use std::io::{Read, Write};
     command
@@ -87,7 +146,7 @@ fn model_output(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
@@ -96,6 +155,14 @@ fn model_output(
             .take(32 * 1024 * 1024)
             .read_to_end(&mut bytes)
             .map(|_| bytes)
+    });
+    // Model stderr (torch warnings, tracebacks) is the only clue when a run
+    // silently returns None — capture it for the /logs page instead of dropping it.
+    let stderr = child.stderr.take()?;
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(64 * 1024).read_to_end(&mut bytes);
+        bytes
     });
     if let Some(input) = input {
         if child
@@ -107,6 +174,7 @@ fn model_output(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            log_activity("model", "failed", &format!("{label}: could not write stdin"));
             return None;
         }
     }
@@ -121,15 +189,48 @@ fn model_output(
                 tracing::warn!("model runner timed out or could not be monitored");
                 let _ = child.kill();
                 let _ = child.wait();
+                log_activity(
+                    "model",
+                    "timeout",
+                    &format!(
+                        "{label}: killed after {}s",
+                        started.elapsed().as_secs_f64().round()
+                    ),
+                );
                 break None;
             }
         }
     };
     let bytes = reader.join().ok()?.ok()?;
-    if !status?.success() {
+    let err = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
+    let status = status?;
+    let ms = started.elapsed().as_millis();
+    if !status.success() {
+        log_activity(
+            "model",
+            "failed",
+            &format!(
+                "{label}: exit {} in {ms} ms\n{}",
+                status.code().unwrap_or(-1),
+                clip(&err, 1500)
+            ),
+        );
         return None;
     }
-    serde_json::from_slice(&bytes).ok()
+    let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
+    log_activity(
+        "model",
+        if parsed.is_some() { "ok" } else { "failed" },
+        &format!(
+            "{label}: {ms} ms{}",
+            if parsed.is_some() {
+                String::new()
+            } else {
+                format!(" — output was not valid JSON\n{}", clip(&err, 1500))
+            }
+        ),
+    );
+    parsed
 }
 
 fn run_py_json(root: &Path, py: &Path, script: &str, args: &[String]) -> Option<Value> {
@@ -155,7 +256,7 @@ fn run_py_json_stdin_optional(
 ) -> Option<Value> {
     let mut command = Command::new(py);
     command.current_dir(root).arg(root.join(script)).args(args);
-    model_output(command, input, std::time::Duration::from_secs(180))
+    model_output(command, input, std::time::Duration::from_secs(180), script)
 }
 
 /// The web dashboard's [`ModelRunner`]: shells out to the Python torch runners,
@@ -576,6 +677,7 @@ async fn handle(
             | ("POST", "/api/dna/fetch")
             | ("POST", "/api/blood/import-dir")
             | ("POST", "/api/blood/import")
+            | ("POST", "/api/logs/clear")
     ) && !csrf_ok;
     if forbid {
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
@@ -689,6 +791,47 @@ async fn handle(
                 &asset("blood.css", BLOOD_CSS),
             )
             .await
+        }
+        (_, "/logs") | (_, "/logs.html") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/html; charset=utf-8",
+                &asset("logs.html", LOGS_HTML),
+            )
+            .await
+        }
+        (_, "/logs.js") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/javascript; charset=utf-8",
+                &asset("logs.js", LOGS_JS),
+            )
+            .await
+        }
+        (_, "/logs.css") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/css; charset=utf-8",
+                &asset("logs.css", LOGS_CSS),
+            )
+            .await
+        }
+        ("GET", "/api/logs") => {
+            // The /logs page's feed: in-memory activity ring (syncs, model runs,
+            // live-HR, feature toggles), newest first. `kind` filters; `limit` caps.
+            let kind = query_param(query, "kind").unwrap_or_default();
+            let limit = query_param(query, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(200)
+                .clamp(1, ACTIVITY_MAX);
+            json_resp(&mut sock, &json!({ "entries": list_activity(&kind, limit) })).await
+        }
+        ("POST", "/api/logs/clear") => {
+            clear_activity();
+            json_resp(&mut sock, &json!({ "ok": true })).await
         }
         ("GET", "/api/blood/report") => {
             let v = tokio::task::spawn_blocking(crate::blood::report)
@@ -1032,6 +1175,13 @@ fn target_args(c: &mut Command, name: &str, serial: &str) {
 /// "no matching ring" miss a couple of times before giving up.
 fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Result<String> {
     let exe = std::env::current_exe().context("locating oura binary")?;
+    let target = if serial.is_empty() {
+        format!("name={name}")
+    } else {
+        format!("serial={serial}")
+    };
+    log_activity("sync", "start", &format!("sync started ({target})"));
+    let started = std::time::Instant::now();
     let mut last = String::from("sync failed");
     for attempt in 0..3 {
         let mut c = Command::new(&exe);
@@ -1046,9 +1196,29 @@ fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Res
         let out = c.output().context("running `oura sync`")?;
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            return Ok(stdout.lines().last().unwrap_or("synced").trim().to_string());
+            let msg = stdout.lines().last().unwrap_or("synced").trim().to_string();
+            log_activity(
+                "sync",
+                "ok",
+                &format!(
+                    "sync finished in {}s ({target})\n{}",
+                    started.elapsed().as_secs_f64().round(),
+                    clip(&stdout, 4000)
+                ),
+            );
+            return Ok(msg);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
+        log_activity(
+            "sync",
+            "retry",
+            &format!(
+                "attempt {} failed after {}s ({target})\n{}",
+                attempt + 1,
+                started.elapsed().as_secs_f64().round(),
+                clip(&stderr, 4000)
+            ),
+        );
         last = stderr
             .lines()
             .last()
@@ -1069,6 +1239,14 @@ fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Res
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+    log_activity(
+        "sync",
+        "failed",
+        &format!(
+            "sync failed after {}s ({target}): {last}",
+            started.elapsed().as_secs_f64().round()
+        ),
+    );
     Err(anyhow!("{last}"))
 }
 
@@ -1119,6 +1297,14 @@ async fn live_hr(
         .context("running `oura live-hr`")?;
     let stderr = child.stderr.take().context("child stderr")?;
     let stderr_task = tokio::spawn(read_stderr_tail(stderr));
+    log_activity(
+        "live-hr",
+        "start",
+        &format!(
+            "live heart-rate session started ({} s window)",
+            LIVE_HR_SECONDS
+        ),
+    );
     let mut lines = tokio::io::BufReader::new(child.stdout.take().context("child stdout")?).lines();
     let mut probe = [0u8; 1];
     let session = tokio::time::timeout(std::time::Duration::from_secs(210), async {
@@ -1148,6 +1334,7 @@ async fn live_hr(
             let _ = child.kill().await;
             let _ = child.wait().await;
             stderr_task.abort();
+            log_activity("live-hr", "stopped", "live heart-rate session stopped early (client disconnected or timeout)");
             return send_line(
                 &mut wr,
                 &json!({"error": "Live heart rate stopped or timed out."}),
@@ -1157,12 +1344,14 @@ async fn live_hr(
     };
     let stderr = stderr_task.await.unwrap_or_default();
     let last = if ok {
+        log_activity("live-hr", "ok", "live heart-rate session finished");
         json!({ "done": true })
     } else {
         let msg = stderr
             .lines()
             .rfind(|l| !l.trim().is_empty())
             .unwrap_or("live heart rate failed");
+        log_activity("live-hr", "failed", &format!("live heart-rate session failed: {}", clip(&stderr, 2000)));
         json!({ "error": msg.trim() })
     };
     send_line(&mut wr, &last).await
@@ -1227,6 +1416,7 @@ fn run_feature(
     })?;
     let exe = std::env::current_exe().context("locating oura binary")?;
     let on = if mode == "off" { "off" } else { "on" };
+    log_activity("feature", "start", &format!("feature {feature} -> {mode}"));
     let mut last = String::from("toggle failed");
     for attempt in 0..3 {
         let mut c = Command::new(&exe);
@@ -1248,11 +1438,13 @@ fn run_feature(
         let mode_int = if mode == "off" { 0 } else { 1 };
         if stdout.contains("SUCCESS") {
             write_feature_mode(db, feature, mode_int);
+            log_activity("feature", "ok", &format!("{feature} turned {on}"));
             return Ok(format!("{feature} turned {on}"));
         }
         if stdout.contains("result 0x20") {
             // ring refuses to set a mode it's already in → it's already in that state
             write_feature_mode(db, feature, mode_int);
+            log_activity("feature", "ok", &format!("{feature} was already {on} (no change)"));
             return Ok(format!("{feature} is already {on} (no change needed)"));
         }
         last = stdout
@@ -1275,6 +1467,7 @@ fn run_feature(
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+    log_activity("feature", "failed", &format!("feature {feature} -> {mode} failed: {last}"));
     Err(anyhow!("{last}"))
 }
 
@@ -1376,7 +1569,7 @@ mod tests {
     fn stalled_runner_is_killed_and_reaped() {
         let mut command = Command::new("python3");
         command.args(["-c", "import time; time.sleep(30)"]);
-        assert!(model_output(command, None, std::time::Duration::from_millis(60)).is_none());
+        assert!(model_output(command, None, std::time::Duration::from_millis(60), "test").is_none());
     }
     #[test]
     fn large_runner_output_does_not_deadlock_and_input_reaches_eof() {
@@ -1386,10 +1579,26 @@ mod tests {
             "import json,sys; print(json.dumps({'input':sys.stdin.read(),'data':'x'*200000}))",
         ]);
         let value =
-            model_output(command, Some(b"window"), std::time::Duration::from_secs(5)).unwrap();
+            model_output(command, Some(b"window"), std::time::Duration::from_secs(5), "test").unwrap();
         assert_eq!(value["input"], "window");
         assert_eq!(value["data"].as_str().unwrap().len(), 200000);
     }
+    #[test]
+    fn activity_ring_caps_filters_and_clears() {
+        // Other tests log concurrently, so assert only on this test's own kind.
+        for i in 0..(ACTIVITY_MAX + 25) {
+            log_activity("sync", "ok", &format!("ringtest-{i}"));
+        }
+        let all = list_activity("", ACTIVITY_MAX);
+        assert_eq!(all.len(), ACTIVITY_MAX); // ring capped
+        let syncs = list_activity("sync", 1000);
+        assert!(!syncs.is_empty());
+        assert!(syncs.iter().all(|e| e["kind"] == "sync"));
+        assert_eq!(syncs[0]["detail"], format!("ringtest-{}", ACTIVITY_MAX + 24)); // newest first
+        clear_activity();
+        assert!(list_activity("", 10).is_empty());
+    }
+
     #[test]
     fn parses_live_hr_beat_lines() {
         assert_eq!(parse_beat_line("  81 bpm (IBI 733 ms)"), Some((81, 733)));

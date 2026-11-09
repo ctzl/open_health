@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%230d9488'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23ffffff' stroke-width='4' opacity='.55'/%3E%3C/svg%3E" />
+  <title>open_oura — logs</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/logs.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="word">open_oura</span>
+        <span class="dna-sub">activity logs</span>
+      </div>
+      <div class="actions">
+        <a class="action" href="/" title="Back to dashboard">
+          <span class="ic" style="--i:url(/icons/arrow-left.svg)"></span>
+          <span>Dashboard</span>
+        </a>
+      </div>
+    </header>
+
+    <p class="digest">
+      What the dashboard just did: every sync (with the ring's own output), every torch model run
+      (duration, failures with the Python stderr), live heart-rate sessions, and feature toggles.
+      The log lives in the dashboard's memory — it answers "what just happened and why did it fail";
+      durable progress lives in the sync cursor.
+    </p>
+
+    <section class="panel" id="log-panel">
+      <div class="panel-head">
+        <h2><span class="ic" style="--i:url(/icons/terminal.svg)"></span>Activity log</h2>
+        <div class="lg-controls">
+          <div class="lg-filters" role="tablist" aria-label="Filter log kind">
+            <button class="lg-filter is-on" data-kind="">All</button>
+            <button class="lg-filter" data-kind="sync">Sync</button>
+            <button class="lg-filter" data-kind="model">Models</button>
+            <button class="lg-filter" data-kind="live-hr">Live HR</button>
+            <button class="lg-filter" data-kind="feature">Features</button>
+          </div>
+          <label class="lg-auto" title="Refresh the feed every few seconds">
+            <input type="checkbox" id="lg-auto" checked /> auto
+          </label>
+          <button class="lg-btn" id="lg-refresh" title="Refresh now">
+            <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
+          </button>
+          <button class="lg-btn lg-danger" id="lg-clear" title="Clear the log">Clear</button>
+        </div>
+      </div>
+      <div id="lg-status" class="lg-count">loading…</div>
+      <div id="lg-list" class="lg-list"></div>
+    </section>
+  </div>
+  <script src="/logs.js"></script>
+</body>
+</html>

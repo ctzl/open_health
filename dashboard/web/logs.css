@@ -1,0 +1,55 @@
+/* Activity logs — layers on styles.css, reusing its tokens + panel look.
+   Shares the .dna-sub helper with the DNA/blood pages. */
+
+.lg-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lg-filters { display: inline-flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px; }
+.lg-filter {
+  font: 540 12px/1 var(--sans); color: var(--muted);
+  background: none; border: 0; border-radius: 4px; padding: 6px 10px; cursor: pointer;
+}
+.lg-filter:hover { color: var(--text); }
+.lg-filter.is-on { background: var(--accent-soft); color: var(--accent); }
+.lg-auto { font: 400 12px/1 var(--sans); color: var(--muted); display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
+.lg-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 540 12px/1 var(--sans); color: var(--text);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 7px 10px; cursor: pointer;
+}
+.lg-btn:hover { border-color: var(--accent); }
+.lg-btn .ic { font-size: 14px; color: var(--muted); }
+.lg-danger { color: var(--warn); }
+.lg-count { font: 400 11px/1 var(--mono); color: var(--faint); padding: 8px 2px 2px; }
+
+/* log rows */
+.lg-list { display: flex; flex-direction: column; }
+.lg-row {
+  display: grid; grid-template-columns: 150px 64px 58px 1fr auto; gap: 10px; align-items: baseline;
+  padding: 8px 2px; border-top: 1px solid var(--line-soft);
+  font-variant-numeric: tabular-nums;
+}
+.lg-row:first-child { border-top: 0; }
+.lg-ts { font: 400 11px/1.4 var(--mono); color: var(--faint); white-space: nowrap; }
+.lg-kind { font: 600 9px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.lg-status { font: 600 9px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; }
+.lg-status-ok { color: var(--accent); }
+.lg-status-start, .lg-status-retry, .lg-status-stopped { color: var(--warn); }
+.lg-status-failed, .lg-status-timeout { color: #b3403a; }
+.lg-summary { font: 400 12px/1.45 var(--mono); color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.lg-expand {
+  font: 540 11px/1 var(--sans); color: var(--muted);
+  background: none; border: 0; cursor: pointer; padding: 2px 4px; white-space: nowrap;
+}
+.lg-expand:hover { color: var(--accent); }
+.lg-detail {
+  grid-column: 1 / -1; margin: 6px 0 2px; padding: 10px 12px;
+  font: 400 11px/1.5 var(--mono); color: var(--muted);
+  background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+  white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto;
+}
+.lg-empty { font: 400 13px/1.5 var(--sans); color: var(--faint); padding: 14px 2px; }
+
+@media (max-width: 760px) {
+  .lg-row { grid-template-columns: 1fr auto; grid-auto-flow: row; }
+  .lg-ts, .lg-kind, .lg-status { font-size: 10px; }
+}
