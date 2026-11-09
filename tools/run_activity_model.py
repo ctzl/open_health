@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Run Oura automatic_activity_detection 3.1.11 with Android-parity inputs.
+"""Run Oura's automatic_activity_detection model with Android-parity inputs.
 
 The official Android app evaluates one local calendar day at a time and feeds
 the 12-column step-motion series produced by steps_motion_decoder. Those details
 are essential: omitting or misordering gait can turn a hike into cycling.
+
+The model filename is never pinned — the asset set rotates with every app
+version — so we resolve the newest `automatic_activity_detection_3_1_*.pt` and
+detect its calling convention from the loaded schema (3.1.15 replaced the three
+scalar settings tensors with an optional `global_settings`).
 """
 import argparse
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 import warnings
@@ -23,10 +29,33 @@ from epoch_time import build_epochs, is_dated, make_unix_s
 warnings.filterwarnings("ignore", message=".*searchsorted.*")
 
 REPO = Path(__file__).resolve().parent.parent
-MODEL_NAME = "automatic_activity_detection_3_1_11.pt"
-MODEL = resolve_models_dir(REPO, MODEL_NAME) / MODEL_NAME
-STEP_MODEL = MODEL.parent / "steps_motion_decoder_2_0_0.pt"
-MODEL_VERSION = "3.1.11"
+
+
+def find_model():
+    """Newest decrypted AAD model, like run_cva_model.find_model(): the asset
+    set rotates every app version (3.1.11 is already gone), so match by prefix
+    and take the highest version."""
+    for d in (REPO / "notes" / "models", REPO.parent / "open_oura" / "notes" / "models"):
+        cands = sorted(d.glob("automatic_activity_detection_3_1_*.pt"),
+                       key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+        if cands:
+            return cands[-1]
+    sys.exit("error: no decrypted automatic_activity_detection_3_1_*.pt in notes/models "
+             "— decrypt the assets with model_key.hex first")
+
+
+MODEL = find_model()
+MODEL_VERSION = ".".join(re.findall(r"\d+", MODEL.name))
+
+
+def find_step_decoder():
+    """Newest steps_motion_decoder in the same directory (also unpinned)."""
+    cands = sorted(MODEL.parent.glob("steps_motion_decoder_*.pt"),
+                   key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+    return cands[-1] if cands else None
+
+
+STEP_MODEL = find_step_decoder()
 
 BEHAVIOR = {
     -1: "nothing", 0: "<empty>", 1: "badminton", 2: "boxing", 3: "crossCountrySkiing",
@@ -115,14 +144,15 @@ def model_would_reject(met, motion, temperature, heart_rate, step_rows):
     return met[0][0] > last_valid
 
 
-STEP_MODEL_MOBILE = MODEL.parent / "mobile" / "steps_motion_decoder_2_0_0.ptl"
+STEP_MODEL_MOBILE = MODEL.parent / "mobile" / (
+    STEP_MODEL.name.replace(".pt", ".ptl") if STEP_MODEL else "steps_motion_decoder_2_0_0.ptl")
 
 
 def load_step_decoder():
     """The gait decoder: the full TorchScript when installed, else the mobile export
     (same weights, lite-interpreter bytecode) that ships in the iOS app. Without it
     the model runs on MET/motion alone and finds far fewer sessions than the app."""
-    if STEP_MODEL.exists():
+    if STEP_MODEL and STEP_MODEL.exists():
         return torch.jit.load(str(STEP_MODEL), map_location="cpu").eval()
     if STEP_MODEL_MOBILE.exists():
         from torch.jit.mobile import _load_for_lite_interpreter
@@ -175,6 +205,26 @@ def decode_stepmotion(db, unix_seconds, enabled, epochs, serial=None):
                   for ts, values in zip(out_ts.flatten().tolist(), out_data.tolist()))
 
 
+def model_settings(model, args):
+    """Trailing settings args for the model call, adapted to the loaded schema.
+
+    AAD <=3.1.12 takes three scalar tensors positionally (probability_threshold,
+    minimum_duration_minutes, allow_non_wear). 3.1.15 replaced them with one
+    optional `global_settings` row read by column — 3=allow_non_wear,
+    12=is_workout_proba_threshold, 26=min_workout_duration_minutes — where NaN
+    falls back to the model's baked-in default (verified against the serialized
+    `_global_setting` helper). We only override the three we know; the rest stay NaN.
+    """
+    names = [a.name for a in model.forward.schema.arguments]
+    if "global_settings" in names:
+        row = [float("nan")] * 72
+        row[3] = 0.0  # allow_non_wear=0 -> non-wear segments filtered, as before
+        row[12] = args.threshold
+        row[26] = args.min_duration
+        return [torch.tensor(row, dtype=torch.float32).reshape(1, -1)]
+    return [torch.tensor(args.threshold), torch.tensor(args.min_duration), torch.tensor(0.0)]
+
+
 def run_day(model, day, day_start_min, signals, steps, args):
     day_end_min = day_start_min + 24 * 60
 
@@ -201,7 +251,7 @@ def run_day(model, day, day_start_min, signals, steps, args):
         workouts, _, _ = model(
             context, user, tensor(met, 2), tensor(step_rows, 12), tensor(motion, 9, (lo, hi)),
             tensor(temperature, 2, (lo, hi)), tensor(heart_rate, 2, (lo, hi)), None, None,
-            torch.tensor(args.threshold), torch.tensor(args.min_duration), torch.tensor(0.0),
+            *model_settings(model, args),
         )
 
     sessions = []
