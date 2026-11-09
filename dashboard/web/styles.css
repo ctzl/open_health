@@ -987,6 +987,9 @@ body.page-open { overflow: hidden; }
 .il-bm-val em { font-style: normal; color: var(--muted); font-size: 11px; margin-left: 4px; }
 .il-foot { font-family: var(--mono); font-size: 10px; color: var(--faint); letter-spacing: 0.02em; }
 
+/* Stress & restored events (local DSA chain) — reuses the il-* rows above */
+.stress { display: flex; flex-direction: column; gap: 12px; }
+
 /* ring-clock notice (nights withheld until a sync anchors them) */
 .clock-note { margin-top: 14px; padding: 12px 14px; border: 1px solid color-mix(in oklab, var(--warn) 40%, transparent); border-radius: 10px; }
 .clock-note-title { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--warn); display: flex; gap: 6px; align-items: center; }

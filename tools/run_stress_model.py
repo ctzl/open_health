@@ -41,10 +41,9 @@ from statistics import median
 
 import torch
 
-from _common import resolve_db
+from _common import resolve_db, resolve_models_dir
 
 REPO = Path(__file__).resolve().parent.parent
-MODEL = REPO / "notes" / "models" / "stress_daytime_sensing_1_1_0.pt"
 DS_PER_5MIN = 3000          # 5 min in ring deciseconds (1 s = 10 ds)
 MIN_DAYTIME_FOR_BASELINE = 3  # below this, dhrv_baseline falls back to the night baseline
 OUT_LABELS = ["intensity", "stress_limit", "recovery_limit",
@@ -52,19 +51,21 @@ OUT_LABELS = ["intensity", "stress_limit", "recovery_limit",
               "intensity_scaled", "stress_limit_scaled", "recovery_limit_scaled"]
 
 
-def load(db):
+def load(db, serial=None):
     con = sqlite3.connect(str(db))
+    where = "decoded_json IS NOT NULL" + (" AND serial = ?" if serial else "")
+    params = (serial,) if serial else ()
     bedtimes = sorted({
         (v["bedtime_start_ds"], v["bedtime_end_ds"])
         for (j,) in con.execute(
-            "SELECT decoded_json FROM events WHERE tag=118 AND decoded_json IS NOT NULL")
+            f"SELECT decoded_json FROM events WHERE tag=118 AND {where}", params)
         for v in [json.loads(j)]
     })
     # expand each hrv_event into (timestamp_ds, rmssd_ms) 5-min samples
     samples = []
     for ts, j in con.execute(
-            "SELECT ring_timestamp, decoded_json FROM events "
-            "WHERE tag=93 AND decoded_json IS NOT NULL ORDER BY ring_timestamp"):
+            f"SELECT ring_timestamp, decoded_json FROM events "
+            f"WHERE tag=93 AND {where} ORDER BY ring_timestamp", params):
         for i, r in enumerate(json.loads(j).get("rmssd_ms", [])):
             if r and r > 0:
                 samples.append((ts + i * DS_PER_5MIN, float(r)))
@@ -109,14 +110,17 @@ def main():
     ap.add_argument("--tz", type=float, default=1, help="hours offset for printed clock times")
     ap.add_argument("--met", type=float, default=1.0,
                     help="ring MET to assume for awake samples (must be <=1.8; default sedentary 1.0)")
+    ap.add_argument("--serial", help="restrict to one ring's GATT serial")
     ap.add_argument("--json", action="store_true", help="emit the timeseries as JSON")
     args = ap.parse_args()
 
-    if not MODEL.exists():
-        sys.exit(f"error: model not found: {MODEL} (decrypt notes/models first)")
-    model = torch.jit.load(str(MODEL), map_location="cpu").eval()
+    models_dir = resolve_models_dir(REPO, required="stress_daytime_sensing_1_1_0.pt")
+    model_path = models_dir / "stress_daytime_sensing_1_1_0.pt"
+    if not model_path.exists():
+        sys.exit(f"error: model not found: {model_path} (decrypt notes/models first)")
+    model = torch.jit.load(str(model_path), map_location="cpu").eval()
 
-    bedtimes, samples = load(resolve_db(args.db, REPO))
+    bedtimes, samples = load(resolve_db(args.db, REPO), args.serial)
     if not bedtimes:
         sys.exit("no bedtime_period events — can't separate awake vs sleep HRV")
     if not samples:
