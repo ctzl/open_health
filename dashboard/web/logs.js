@@ -1,5 +1,6 @@
-// open_oura activity logs — renders GET /api/logs (the dashboard's in-memory
-// activity ring: syncs, torch model runs, live-HR sessions, feature toggles).
+// open_oura activity logs — renders GET /api/logs (the dashboard's activity
+// ring: syncs, torch model runs, live-HR sessions, feature toggles; persisted
+// to activity_log.jsonl next to the DB).
 // Newest first; details expand on click; auto-refreshes while the tab is open.
 "use strict";
 
