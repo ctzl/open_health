@@ -916,9 +916,10 @@ body.page-open { overflow: hidden; }
 .key-dialog form { padding-bottom: 18px; }
 
 /* ring switcher dialog */
+.ring-dialog { width: min(560px, calc(100vw - 32px)); }
 .ring-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .ring-row {
-  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px;
+  display: grid; grid-template-columns: 1fr; gap: 10px;
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--surface-2); padding: 10px 12px;
 }
@@ -926,8 +927,10 @@ body.page-open { overflow: hidden; }
 .ring-pick { background: none; border: 0; padding: 0; text-align: left; cursor: pointer; color: var(--text); font-family: var(--sans); }
 .ring-name { font-size: 15px; font-weight: 560; }
 .ring-meta { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.ring-meta code { font-family: var(--mono); }
+.ring-edit { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) auto; gap: 8px; align-items: center; }
 .ring-rename {
-  font-family: var(--sans); font-size: 13px; color: var(--text); width: 140px;
+  font-family: var(--sans); font-size: 13px; color: var(--text); width: 100%; min-width: 0;
   background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 7px 9px;
 }

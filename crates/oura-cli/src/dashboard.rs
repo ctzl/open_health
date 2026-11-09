@@ -748,13 +748,16 @@ async fn handle(
         }
         ("GET", "/api/rings") => {
             // The switcher's data: every registered ring with its display name.
-            let v = match oura_store::storage::Store::open_read_only(&db).and_then(|s| s.list_rings()) {
-                Ok(rings) => Value::Array(
+            let v = match oura_store::storage::Store::open_read_only(&db)
+                .and_then(|s| Ok((s.list_rings()?, s.ring_macs()?)))
+            {
+                Ok((rings, macs)) => Value::Array(
                     rings
                         .iter()
                         .map(|(serial, name, note, _added, _seen, last_sync, _cursor, count)| {
                             json!({
                                 "serial": serial, "name": name, "note": note,
+                                "mac": macs.get(serial),
                                 "last_sync": last_sync, "events": count,
                             })
                         })
@@ -770,7 +773,8 @@ async fn handle(
             let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let serial = req["serial"].as_str().unwrap_or("");
             let name = req["name"].as_str().unwrap_or("").trim();
-            let note = req["note"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            // note absent → leave it alone; note present (even "") → set/clear it.
+            let note = req["note"].as_str().map(|s| s.trim());
             if serial.is_empty() || name.is_empty() {
                 return json_resp(&mut sock, &json!({ "ok": false, "error": "serial and name are required" })).await;
             }
