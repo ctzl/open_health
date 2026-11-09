@@ -2288,39 +2288,58 @@ function openRings() {
     pick.type = "button";
     pick.append(el("div", "ring-name", esc(r.name)));
     const meta = [];
-    if (r.note) meta.push(esc(r.note));
-    meta.push("•••" + String(r.serial).slice(-4));
+    meta.push("serial <code>" + esc(r.serial) + "</code>");
+    if (r.mac) meta.push("mac <code>" + esc(r.mac) + "</code>");
     meta.push((r.events || 0).toLocaleString() + " events");
     if (r.last_sync) meta.push("synced " + new Date(r.last_sync * 1000).toLocaleString());
-    pick.append(el("div", "ring-meta", meta.join(" · ")));
+    const metaEl = el("div", "ring-meta");
+    metaEl.innerHTML = meta.join(" · ");
+    pick.append(metaEl);
     pick.addEventListener("click", () => {
       selectRing(r.serial);
       dlg.close();
       load();
     });
     row.append(pick);
+
+    // editable details: display name + free-form note, saved together
+    const edit = el("div", "ring-edit");
     const nameIn = el("input", "ring-rename");
     nameIn.type = "text";
     nameIn.value = r.name;
     nameIn.maxLength = 40;
-    nameIn.setAttribute("aria-label", `Rename ${r.name}`);
-    const save = el("button", "btn-text", "Rename");
+    nameIn.placeholder = "name";
+    nameIn.setAttribute("aria-label", `Name for ${r.name}`);
+    const noteIn = el("input", "ring-rename");
+    noteIn.type = "text";
+    noteIn.value = r.note || "";
+    noteIn.maxLength = 120;
+    noteIn.placeholder = "description (optional)";
+    noteIn.setAttribute("aria-label", `Description for ${r.name}`);
+    const save = el("button", "btn-text", "Save");
     save.type = "button";
     save.addEventListener("click", async () => {
       const v = nameIn.value.trim();
-      if (!v || v === r.name) return;
+      const note = noteIn.value.trim();
+      if (!v) return toast("A ring needs a name.", "error");
+      if (v === r.name && note === (r.note || "")) return;
+      save.disabled = true;
       try {
-        const j = await (await postDash("/api/rings", { serial: r.serial, name: v })).json();
+        const j = await (await postDash("/api/rings", { serial: r.serial, name: v, note })).json();
         if (j.ok) {
-          toast(`Renamed to “${v}”.`, "ok");
-          nameIn.value = v;
+          toast("Ring details saved.", "ok");
           await fetchRings();
-        } else toast(j.error || "Rename failed.", "error");
+          dlg.close();
+          openRings(); // rebuild so the row shows the new values
+        } else toast(j.error || "Save failed.", "error");
       } catch (e) {
-        toast("Rename failed: " + e.message, "error");
+        toast("Save failed: " + e.message, "error");
+      } finally {
+        save.disabled = false;
       }
     });
-    row.append(nameIn, save);
+    edit.append(nameIn, noteIn, save);
+    row.append(edit);
     list.append(row);
   });
   dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
