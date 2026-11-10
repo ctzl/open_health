@@ -7,11 +7,15 @@
 #   .\run-dashboard.ps1 -Lan         # also reachable from other LAN devices
 #   .\run-dashboard.ps1 -Build       # rebuild the binary first
 #   .\run-dashboard.ps1 -Port 8095   # alternate port
+#
+# Blood lab PDFs (blood *.pdf + blood.db) are served from
+# ~\Documents\official\health by default; override with -BloodDir.
 
 param(
     [switch]$Build,
     [switch]$Lan,
-    [int]$Port = 8090
+    [int]$Port = 8090,
+    [string]$BloodDir = (Join-Path $HOME 'Documents\official\health')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +54,14 @@ if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyCon
 $tzOffset = [TimeZoneInfo]::Local.GetUtcOffset([DateTimeOffset]::Now).TotalHours
 
 Write-Host "tz offset: $tzOffset  db: $db"
+$bloodArgs = @()
+if ($BloodDir -and (Test-Path $BloodDir)) {
+    $bloodArgs = @('--blood-files', $BloodDir)
+    $pdfs = @(Get-ChildItem -Path $BloodDir -Filter 'blood *.pdf' -ErrorAction SilentlyContinue)
+    Write-Host "blood: $($pdfs.Count) report(s) from $BloodDir"
+} elseif ($BloodDir) {
+    Write-Warning "blood dir not found: $BloodDir (blood panel disabled)"
+}
 $lanArgs = @()
 if ($Lan) {
     $lanArgs = @('--lan')
@@ -59,4 +71,19 @@ if ($Lan) {
     Write-Host "note: Windows may prompt for a firewall rule on first LAN connection"
 }
 Write-Host "open http://127.0.0.1:$Port  (Ctrl+C to stop)"
-& $exe dashboard --db $db --key-file $keyFile --tz-offset $tzOffset --port $Port @lanArgs
+# Keep the operational log in a file, not just in the terminal session
+# (startup lines, blood backfill/imports, model recomputes, errors).
+# Tee-Object writes UTF-16 and keeps ANSI colors, which corrupts the existing
+# UTF-8 log — append UTF-8 lines with the color codes stripped instead.
+$log = Join-Path (Split-Path $repo -Parent) 'open_oura\dashboard-server.log'
+Write-Host "log: $log"
+# The binary emits UTF-8; decode its output as UTF-8 (not the OEM codepage)
+# so em-dashes and timestamps survive the tee.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$esc = [char]27
+& $exe dashboard --db $db --key-file $keyFile --tz-offset $tzOffset --port $Port @bloodArgs @lanArgs 2>&1 |
+    ForEach-Object {
+        $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { [string]$_ }
+        Write-Output $line
+        Add-Content -Path $log -Value ($line -replace "$esc\[[0-9;]*m", '') -Encoding utf8
+    }
