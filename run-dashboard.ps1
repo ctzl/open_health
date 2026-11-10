@@ -8,7 +8,7 @@
 #   .\run-dashboard.ps1 -Build       # rebuild the binary first
 #   .\run-dashboard.ps1 -Port 8095   # alternate port
 #
-# Blood lab PDFs (blood *.pdf + blood.db) are served from
+# Blood lab PDFs (per-profile dirs <serial>\*.pdf + blood.db) are served from
 # ~\Documents\official\health by default; override with -BloodDir.
 
 param(
@@ -57,7 +57,7 @@ Write-Host "tz offset: $tzOffset  db: $db"
 $bloodArgs = @()
 if ($BloodDir -and (Test-Path $BloodDir)) {
     $bloodArgs = @('--blood-files', $BloodDir)
-    $pdfs = @(Get-ChildItem -Path $BloodDir -Filter 'blood *.pdf' -ErrorAction SilentlyContinue)
+    $pdfs = @(Get-ChildItem -Path $BloodDir -Filter '*.pdf' -Recurse -ErrorAction SilentlyContinue)
     Write-Host "blood: $($pdfs.Count) report(s) from $BloodDir"
 } elseif ($BloodDir) {
     Write-Warning "blood dir not found: $BloodDir (blood panel disabled)"

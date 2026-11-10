@@ -137,7 +137,8 @@ async function onImportClick() {
     if (!d.ok && d.message) {
       $("import-hint").textContent = d.message;
     } else {
-      $("import-hint").textContent = `${d.imported} imported · ${d.duplicates} duplicates · ${d.failed} failed`;
+      $("import-hint").textContent =
+        `${d.imported} imported · ${d.duplicates} duplicates · ${d.failed} failed · from ${d.dir}`;
       await loadReport();
     }
   } catch (e) {

@@ -92,8 +92,9 @@ per-ring via rings.auth_key_hex); sharing one profile across rings.
 ## 7. Deliberate simplifications
 - No profile CRUD: rename = rename ring (POST /api/rings), add profile =
   pair a ring (open_oura sync), remove = ring registry.
-- No per-profile blood dir: one blood.db, serial column. Keeps the
-  import-dir UX and run-dashboard.ps1 unchanged.
+- No per-profile blood *database*: one blood.db, serial column. Documents
+  themselves do live in per-profile directories (see §9) — the DB stays
+  single-file so assign/merge never touches SQLite attachments.
 - Cookie-based active profile (already the ring-switcher mechanism); no
   server-side session.
 
@@ -121,3 +122,25 @@ per-ring via rings.auth_key_hex); sharing one profile across rings.
   assign/revert round-trips both stores; unassigned VCF visible to all.
 - Main dashboard switcher relabeled "Profile" (index.html); behavior
   unchanged.
+
+## 9. Per-profile blood document directories (added after §8)
+- Layout: `<blood_dir>/<ring-serial>/*.pdf` (e.g.
+  `Documents/official/health/40160B2500000001/`). `blood.db` stays at the
+  root. Rationale: the wife's lab PDFs don't carry the `blood ` filename
+  prefix, and a shared flat folder forced prefix hacks; inside a profile
+  directory **any** `*.pdf` belongs to that person.
+- `profile_dir()` validates the serial (alphanumeric/`-`/`_`) so a path can
+  never escape the root; `""` (unassigned) has no dir — those files sit at
+  the root and keep the legacy `blood *.pdf` scan filter.
+- **Import** (`POST /api/blood/import-dir`) scans the active profile's dir
+  (created on demand); the first-run auto-import in `GET /api/blood/report`
+  scans the requested profile's dir. Root/legacy behavior unchanged.
+- **Assign moves the file too**: `POST /api/blood/assign` updates the DB
+  row *and* renames the PDF into the target profile's dir (unassign →
+  root), updating the stored path. A failed file move doesn't roll back the
+  DB reassignment (reported via `file_moved`/`message`).
+- **Startup migration** (idempotent, next to the backfill block in
+  `serve()`): imported PDFs still sitting at the blood root are moved into
+  their profile's dir and their stored paths updated; empty profile dirs
+  are created for every registered ring so the layout is discoverable.
+- `run-dashboard.ps1` counts PDFs recursively for its startup line.

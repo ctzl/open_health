@@ -307,7 +307,8 @@ enum Command {
         /// `dna/files/`; also settable via `$OURA_DNA_FILES`.
         #[arg(long, value_name = "DIR")]
         dna_files: Option<PathBuf>,
-        /// Directory to scan for local blood report PDFs named `blood *.pdf`.
+        /// Root of per-profile blood document dirs (`<ring-serial>/*.pdf`); legacy
+        /// root files keep the `blood *.pdf` filter.
         /// Defaults to `~/Documents/official/health` when present; also settable
         /// via `$OURA_BLOOD_FILES`.
         #[arg(long, value_name = "DIR")]

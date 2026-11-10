@@ -802,23 +802,33 @@ pub async fn serve(
     init_activity_log(&db);
     // Profiles (docs/profiles.md): legacy blood rows (serial='') belong to the
     // primary ring — reassign once at startup so the first profile shows them.
+    // Then move imported PDFs into per-profile document dirs
+    // (<blood_dir>/<serial>/) and create those dirs for every ring, so it is
+    // obvious where new lab PDFs go.
     {
         let db = db.clone();
         let res = tokio::task::spawn_blocking(move || {
-            oura_store::storage::Store::open_read_only(&db)
+            let rings = oura_store::storage::Store::open_read_only(&db)
                 .and_then(|s| s.list_rings())
-                .ok()
-                .and_then(|rings| {
-                    rings.iter().min_by_key(|r| r.3).map(|r| r.0.clone())
-                })
-                .map(|primary| crate::blood::backfill_serial(&primary))
+                .ok()?;
+            let primary = rings.iter().min_by_key(|r| r.3).map(|r| r.0.clone())?;
+            let backfill = crate::blood::backfill_serial(&primary);
+            let migrated = crate::blood::migrate_profile_dirs();
+            crate::blood::ensure_profile_dirs(
+                &rings.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            );
+            Some((backfill, migrated))
         })
         .await
         .unwrap_or(None);
-        if let Some(v) = res {
-            let n = v["reassigned"].as_i64().unwrap_or(0);
+        if let Some((backfill, migrated)) = res {
+            let n = backfill["reassigned"].as_i64().unwrap_or(0);
             if n > 0 {
                 println!("blood: reassigned {n} legacy import(s) to the primary ring");
+            }
+            let m = migrated["moved"].as_i64().unwrap_or(0);
+            if m > 0 {
+                println!("blood: moved {m} imported PDF(s) into per-profile document dirs");
             }
         }
     }

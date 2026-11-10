@@ -4,6 +4,11 @@
 //! `pdftotext -layout` extracts text, deterministic parsers normalize known
 //! SYNLAB/CUF rows, and the results are cached in `blood.db`, separate from the
 //! ring's `oura.db`.
+//!
+//! Layout: `<blood_dir>/blood.db` plus one document directory per profile
+//! (`<blood_dir>/<ring-serial>/*.pdf`). Inside a profile directory every PDF
+//! belongs to that person (any `*.pdf` is scanned); files sitting at the root
+//! predate profiles and keep the legacy `blood *.pdf` scan filter.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -986,8 +991,57 @@ fn scan_pdf_paths(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn import_path_at(dir: &Path, path: &Path, serial: &str) -> Result<Value> {
-    let mut conn = open_db(dir)?;
+/// Every PDF in a directory. Used for per-profile document dirs, where any
+/// lab PDF belongs to that person regardless of the legacy `blood ` prefix.
+fn scan_all_pdfs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && e.file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".pdf")
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Per-profile document directory: `<root>/<ring-serial>/`. Ring serials are
+/// alphanumeric; anything else is rejected so a serial can never escape the
+/// blood root. `""` (unassigned) has no directory — those files stay at the
+/// root.
+fn profile_dir(root: &Path, serial: &str) -> Option<PathBuf> {
+    (!serial.is_empty()
+        && serial
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then(|| root.join(serial))
+}
+
+/// Move an imported PDF into the profile's document dir (root for ""),
+/// returning the new path. No-op when the file is already there.
+fn move_import_pdf(root: &Path, from: &str, serial: &str) -> Result<PathBuf> {
+    let src = PathBuf::from(from);
+    let target = profile_dir(root, serial).unwrap_or_else(|| root.to_path_buf());
+    if src.parent() == Some(target.as_path()) {
+        return Ok(src);
+    }
+    fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
+    let dest = target.join(src.file_name().context("imported pdf has no file name")?);
+    fs::rename(&src, &dest).with_context(|| {
+        format!("moving {} to {}", src.display(), dest.display())
+    })?;
+    Ok(dest)
+}
+
+fn import_path_at(db_dir: &Path, path: &Path, serial: &str) -> Result<Value> {
+    let mut conn = open_db(db_dir)?;
     let report = parse_pdf(path)?;
     let inserted = store_report(&mut conn, &report, serial)?;
     Ok(json!({
@@ -1004,14 +1058,18 @@ fn import_path_at(dir: &Path, path: &Path, serial: &str) -> Result<Value> {
     }))
 }
 
-fn import_dir_at(dir: &Path, serial: &str) -> Result<Value> {
-    let paths = scan_pdf_paths(dir);
+fn import_dir_at(scan_dir: &Path, db_root: &Path, serial: &str, any_pdf: bool) -> Result<Value> {
+    let paths = if any_pdf {
+        scan_all_pdfs(scan_dir)
+    } else {
+        scan_pdf_paths(scan_dir)
+    };
     let mut imported = 0usize;
     let mut duplicates = 0usize;
     let mut failed = 0usize;
     let mut rows = Vec::new();
     for p in paths {
-        match import_path_at(dir, &p, serial) {
+        match import_path_at(db_root, &p, serial) {
             Ok(v) => {
                 if v["imported"].as_bool().unwrap_or(false) {
                     imported += 1;
@@ -1032,7 +1090,7 @@ fn import_dir_at(dir: &Path, serial: &str) -> Result<Value> {
     }
     Ok(json!({
         "ok": failed == 0,
-        "dir": dir.display().to_string(),
+        "dir": scan_dir.display().to_string(),
         "scanned": rows.len(),
         "imported": imported,
         "duplicates": duplicates,
@@ -1041,13 +1099,24 @@ fn import_dir_at(dir: &Path, serial: &str) -> Result<Value> {
     }))
 }
 
-/// `POST /api/blood/import-dir` - scan the configured directory for `blood *.pdf`,
-/// stamping new imports with `serial` (the active profile; "" = unassigned).
+/// `POST /api/blood/import-dir` - scan the active profile's document
+/// directory (`<blood_dir>/<serial>/`, created on demand) for PDFs, stamping
+/// new imports with `serial`. With no profile (""), falls back to the legacy
+/// root scan (`blood *.pdf` only).
 pub fn import_dir(serial: &str) -> Value {
-    let Some(dir) = blood_dir() else {
+    let Some(root) = blood_dir() else {
         return json!({ "ok": false, "message": "no blood directory configured; pass --blood-files DIR" });
     };
-    match import_dir_at(&dir, serial) {
+    let (dir, any_pdf) = match profile_dir(&root, serial) {
+        Some(d) => {
+            if let Err(e) = fs::create_dir_all(&d) {
+                return json!({ "ok": false, "message": format!("creating {}: {e}", d.display()) });
+            }
+            (d, true)
+        }
+        None => (root.clone(), false),
+    };
+    match import_dir_at(&dir, &root, serial, any_pdf) {
         Ok(v) => v,
         Err(e) => json!({ "ok": false, "message": e.to_string() }),
     }
@@ -1105,21 +1174,97 @@ pub fn backfill_serial(primary: &str) -> Value {
 }
 
 /// `POST /api/blood/assign {"sha": ..., "serial": ...}` — move an import (and
-/// its marker rows, via the join) to another profile.
+/// its marker rows, via the join) to another profile, and move its PDF into
+/// the target profile's document directory (unassigned → back to the root).
 pub fn assign(sha: &str, serial: &str) -> Value {
-    let Some(dir) = blood_dir() else {
+    let Some(root) = blood_dir() else {
         return json!({"ok": false, "message": "no blood directory configured"});
     };
-    match open_db(&dir).and_then(|conn| {
-        conn.execute(
+    match open_db(&root).and_then(|conn| {
+        let from = conn
+            .query_row(
+                "SELECT path FROM imports WHERE sha LIKE ?1 || '%'",
+                params![sha],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let n = conn.execute(
             "UPDATE imports SET serial = ?2 WHERE sha LIKE ?1 || '%'",
             params![sha, serial],
-        )
-        .map_err(anyhow::Error::from)
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut move_error = String::new();
+        if let Some(from) = from {
+            match move_import_pdf(&root, &from, serial) {
+                Ok(dest) => {
+                    conn.execute(
+                        "UPDATE imports SET path = ?2 WHERE path = ?1",
+                        params![from, dest.to_string_lossy().as_ref()],
+                    )?;
+                }
+                // The reassignment itself stands; a failed file move only
+                // leaves the PDF in the old location.
+                Err(e) => move_error = e.to_string(),
+            }
+        }
+        Ok(Some(move_error))
     }) {
-        Ok(0) => json!({"ok": false, "message": format!("no import matching sha prefix {sha}")}),
-        Ok(_) => json!({"ok": true}),
+        Ok(None) => json!({"ok": false, "message": format!("no import matching sha prefix {sha}")}),
+        Ok(Some(move_error)) => json!({
+            "ok": true,
+            "file_moved": move_error.is_empty(),
+            "message": move_error,
+        }),
         Err(e) => json!({"ok": false, "message": e.to_string()}),
+    }
+}
+
+/// One-time layout migration: move imported PDFs that still sit at the blood
+/// root into their profile's document directory, updating stored paths.
+/// Idempotent — files already inside a subdirectory are left alone.
+pub fn migrate_profile_dirs() -> Value {
+    let Some(root) = blood_dir() else {
+        return json!({"ok": false, "message": "no blood directory configured"});
+    };
+    match open_db(&root).and_then(|conn| {
+        let rows: Vec<(String, String, String)> = conn
+            .prepare("SELECT sha, path, serial FROM imports WHERE serial != ''")
+            .and_then(|mut st| {
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|m| m.filter_map(|x| x.ok()).collect::<Vec<_>>())
+            })?;
+        let mut moved = 0usize;
+        for (sha, path, serial) in rows {
+            if Path::new(&path).parent() != Some(root.as_path()) {
+                continue; // already inside a document dir
+            }
+            match move_import_pdf(&root, &path, &serial) {
+                Ok(dest) => {
+                    conn.execute(
+                        "UPDATE imports SET path = ?2 WHERE sha = ?1",
+                        params![sha, dest.to_string_lossy().as_ref()],
+                    )?;
+                    moved += 1;
+                }
+                Err(e) => eprintln!("blood: profile-dir migration skipped {path}: {e}"),
+            }
+        }
+        Ok(moved)
+    }) {
+        Ok(n) => json!({"ok": true, "moved": n}),
+        Err(e) => json!({"ok": false, "message": e.to_string()}),
+    }
+}
+
+/// Create empty per-profile document dirs so it is obvious where new PDFs go.
+pub fn ensure_profile_dirs(serials: &[String]) {
+    let Some(root) = blood_dir() else { return };
+    for s in serials {
+        if let Some(d) = profile_dir(&root, s) {
+            let _ = fs::create_dir_all(d);
+        }
     }
 }
 
@@ -1129,7 +1274,16 @@ fn report_from_dir(dir: &Path, serial: Option<&str>) -> Result<Value> {
     // or an empty profile would rescan the PDFs on every request.
     if read_imports(&conn, None)?.is_empty() {
         drop(conn);
-        let _ = import_dir_at(dir, serial.unwrap_or(""));
+        // First run for a profile: scan that profile's document dir; an
+        // unassigned request keeps the legacy root scan.
+        let (scan_dir, any_pdf) = match serial.and_then(|s| profile_dir(dir, s)) {
+            Some(d) => {
+                let _ = fs::create_dir_all(&d);
+                (d, true)
+            }
+            None => (dir.to_path_buf(), false),
+        };
+        let _ = import_dir_at(&scan_dir, dir, serial.unwrap_or(""), any_pdf);
     }
     let conn = open_db(dir)?;
     let imports = read_imports(&conn, serial)?;
@@ -1466,11 +1620,59 @@ Data de inscrição: 09/09/2025   09:16:41
                 ref_text: Some("74 - 106".into()),
             }],
         };
-        assert!(store_report(&mut conn, &report).unwrap());
-        assert!(!store_report(&mut conn, &report).unwrap());
-        assert_eq!(read_imports(&conn).unwrap().len(), 1);
-        assert_eq!(read_marker_rows(&conn).unwrap().len(), 1);
+        assert!(store_report(&mut conn, &report, "").unwrap());
+        assert!(!store_report(&mut conn, &report, "").unwrap());
+        assert_eq!(read_imports(&conn, None).unwrap().len(), 1);
+        assert_eq!(read_marker_rows(&conn, None).unwrap().len(), 1);
+        // per-profile reads see their own rows only (distinct sha per file)
+        let mut report2 = report.clone();
+        report2.sha = "deadbeef0000".into();
+        store_report(&mut conn, &report2, "S1").unwrap();
+        assert_eq!(read_imports(&conn, Some("S1")).unwrap().len(), 1);
+        assert_eq!(read_imports(&conn, Some("S2")).unwrap().len(), 0);
+        assert_eq!(read_marker_rows(&conn, Some("S1")).unwrap().len(), 1);
+        assert_eq!(read_marker_rows(&conn, Some("S2")).unwrap().len(), 0);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_dirs_and_pdf_scans() {
+        let root = temp_dir("profile_dirs");
+        // serials are validated so a path can never escape the root
+        assert_eq!(profile_dir(&root, ""), None);
+        assert_eq!(profile_dir(&root, "../escape"), None);
+        assert_eq!(
+            profile_dir(&root, "40160B2500000001"),
+            Some(root.join("40160B2500000001"))
+        );
+        let pd = root.join("S1");
+        fs::create_dir_all(&pd).unwrap();
+        for name in ["LK blood 09-11-2025.pdf", "blood 27-07-2022.pdf", "notes.txt"] {
+            fs::write(pd.join(name), "x").unwrap();
+        }
+        fs::write(root.join("LK blood root.pdf"), "x").unwrap();
+        fs::write(root.join("blood root.pdf"), "x").unwrap();
+        // inside a profile dir any PDF counts; at the root only the legacy prefix
+        assert_eq!(scan_all_pdfs(&pd).len(), 2);
+        assert_eq!(scan_pdf_paths(&root).len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_import_pdf_relocates_and_is_idempotent() {
+        let root = temp_dir("move_pdf");
+        let src = root.join("blood x.pdf");
+        fs::write(&src, "x").unwrap();
+        let dest = move_import_pdf(&root, &src.to_string_lossy(), "S1").unwrap();
+        assert_eq!(dest, root.join("S1").join("blood x.pdf"));
+        assert!(dest.exists() && !src.exists());
+        // already in place: no-op
+        let again = move_import_pdf(&root, &dest.to_string_lossy(), "S1").unwrap();
+        assert_eq!(again, dest);
+        // unassigned moves back to the root
+        let back = move_import_pdf(&root, &dest.to_string_lossy(), "").unwrap();
+        assert_eq!(back, src);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1510,11 +1712,22 @@ Data de inscrição: 09/09/2025   09:16:41
 
     #[test]
     fn real_june_pdf_matches_golden_when_present() {
-        let path = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-            .join("Documents/official/health/blood 09-06-2026.pdf");
-        if !path.exists() {
-            return;
+        // the PDF lives in the owner's profile dir since the layout
+        // migration; check the legacy root location too
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join("Documents/official/health");
+        let mut candidates = vec![root.join("blood 09-06-2026.pdf")];
+        if let Ok(rd) = fs::read_dir(&root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.file_name().is_some_and(|n| n == "blood 09-06-2026.pdf") {
+                    candidates.push(p);
+                }
+            }
         }
+        let Some(path) = candidates.iter().find(|p| p.exists()).cloned() else {
+            return;
+        };
         let expected: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/blood_june_2026_key_rows.json"
         ))
