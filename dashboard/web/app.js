@@ -2246,13 +2246,15 @@ let LOAD_SEQ = 0;
 // rebuild can't poll forever.
 let RECOMPUTE_POLL = null;
 let RECOMPUTE_TRIES = 0;
+let LAST_SUMMARY_RAW = null; // last rendered /api/summary body, to skip no-op re-renders
 async function load() {
   // guard against overlapping loads (sync/profile-save during an in-flight build):
   // a slower earlier response must not overwrite a newer one.
   const seq = ++LOAD_SEQ;
-  let d;
+  let d, raw;
   try {
-    d = await (await fetch(`/api/summary?tz=${browserTzOffset()}${ringQS()}`)).json();
+    raw = await (await fetch(`/api/summary?tz=${browserTzOffset()}${ringQS()}`)).text();
+    d = JSON.parse(raw);
   } catch (e) {
     if (seq === LOAD_SEQ) showLoadError("Could not reach the local server.");
     return;
@@ -2262,6 +2264,19 @@ async function load() {
     showLoadError(d.error);
     return;
   }
+  if (d.recomputing && raw === LAST_SUMMARY_RAW) {
+    // A recompute poll got back the exact same cached payload we already
+    // rendered. Re-rendering would only flash the charts (HR chart included)
+    // once per poll for the whole rebuild — keep waiting instead.
+    if (++RECOMPUTE_TRIES <= 12) {
+      clearTimeout(RECOMPUTE_POLL);
+      RECOMPUTE_POLL = setTimeout(() => {
+        if (seq === LOAD_SEQ) load();
+      }, 8000);
+    }
+    return;
+  }
+  LAST_SUMMARY_RAW = raw;
   CURRENT_PROFILE = d.profile || null;
   CURRENT_TZ = d.tz || 0;
   LAST_DEVICE_SERIAL = d.device && d.device.serial;
