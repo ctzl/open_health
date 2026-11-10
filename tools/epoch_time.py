@@ -1,5 +1,13 @@
-"""Epoch-aware ring deciseconds -> wall clock, anchored by time-sync and RTC events."""
+"""Epoch-aware ring deciseconds -> wall clock, anchored by time-sync and RTC events.
 
+Hot path (every decoded event calls unix_s + is_dated): the anchor lookups here
+are O(log anchors) via bisect over per-epoch structures prepared once per run.
+Keep semantics identical to crates/oura-summary/src/ring_time.rs and
+EventStore.RingClock on iOS — including tie-breaking, which follows Python's
+min() first-wins order over the original insertion order.
+"""
+
+import bisect
 import json
 
 EPOCH_RESET_SLACK_DS = 6 * 3600 * 10
@@ -18,8 +26,12 @@ def bracket(anchors, ds):
     anchor's offset applies from the stall on), or `("erratic", None)` when the counter
     ran faster than wall time (nothing between them is datable). Outside the anchored
     range the nearest anchor extrapolates as usual."""
-    anchors = sorted(anchors)
-    idx = next((i for i, (a, _) in enumerate(anchors) if a >= ds), len(anchors))
+    return _bracket(sorted(anchors), [a[0] for a in sorted(anchors)], ds)
+
+
+def _bracket(anchors, dsl, ds):
+    """Same as bracket() but over anchors pre-sorted by ds with a parallel ds list."""
+    idx = bisect.bisect_left(dsl, ds)
     if idx == 0 or idx >= len(anchors):
         return "consistent", None
     prev, nxt = anchors[idx - 1], anchors[idx]
@@ -35,12 +47,47 @@ def bracket(anchors, ds):
     return "consistent", None
 
 
+def _nearest(anchors, dsl, ds):
+    """Anchor closest to `ds`; ties resolve to the earliest in original insertion
+    order, matching min(e[5], key=lambda a: abs(a[0] - ds))."""
+    idx = bisect.bisect_left(dsl, ds)
+    if idx <= 0:
+        return anchors[0]
+    if idx >= len(anchors):
+        return anchors[-1]
+    before, after = anchors[idx - 1], anchors[idx]
+    # Distances are non-negative here; compare (distance, insertion index) tuples.
+    return before if (ds - before[0], before[2]) <= (after[0] - ds, after[2]) else after
+
+
+# id(epochs) -> (epochs, [(sorted_anchors, ds_list), ...]). Callers build epochs
+# once and query millions of times; holding the list reference keeps the id valid.
+_PREPARED = {}
+
+
+def _prepared(epochs):
+    key = id(epochs)
+    hit = _PREPARED.get(key)
+    if hit is not None and hit[0] is epochs:
+        return hit[1]
+    prepared = []
+    for e in epochs:
+        indexed = [(ds, unix, i) for i, (ds, unix) in enumerate(e[5])]
+        indexed.sort()
+        prepared.append((indexed, [a[0] for a in indexed]))
+    _PREPARED[key] = (epochs, prepared)
+    if len(_PREPARED) > 16:  # bounded: one entry per build_epochs() result in flight
+        for stale in [k for k, v in _PREPARED.items() if v[0] is not epochs]:
+            del _PREPARED[stale]
+    return prepared
+
+
 def build_epochs(rows):
     """Build boot epochs from `(ds, captured)` pairs or DB `(ds, tag, json, captured)` rows.
 
     Epoch layout stays list-based for existing callers:
     `[min_ds, max_ds, fallback_unix, capture_min, capture_max, [(ds, unix), ...],
-    [ring_start ds, ...]]`.
+    [ring_start ds, ...]]`
     """
     normalized = []
     for row in rows:
@@ -73,27 +120,37 @@ def build_epochs(rows):
     return epochs
 
 
+def _capture_distance(epoch, captured_unix):
+    if captured_unix < epoch[3]:
+        return epoch[3] - captured_unix
+    if captured_unix > epoch[4]:
+        return captured_unix - epoch[4]
+    return 0
+
+
+def _pick_epoch(epochs, ds, captured_unix):
+    """The boot that owns `ds`, by capture-window proximity (or narrowest span)."""
+    candidates = [i for i, e in enumerate(epochs)
+                  if e[0] - EPOCH_RESET_SLACK_DS <= ds <= e[1] + EPOCH_RESET_SLACK_DS]
+    if not candidates:
+        return len(epochs) - 1
+    if captured_unix is not None:
+        return min(candidates, key=lambda i: _capture_distance(epochs[i], captured_unix))
+    return min(candidates, key=lambda i: epochs[i][1] - epochs[i][0])
+
+
 def make_unix_s(epochs):
     """Return `f(ds, captured_unix=None)` using time-sync, with capture fallback."""
+    prepared = _prepared(epochs)
+
     def unix_s(ds, captured_unix=None):
-        candidates = [e for e in epochs
-                      if e[0] - EPOCH_RESET_SLACK_DS <= ds <= e[1] + EPOCH_RESET_SLACK_DS]
-        if captured_unix is not None and candidates:
-            def capture_distance(e):
-                if captured_unix < e[3]:
-                    return e[3] - captured_unix
-                if captured_unix > e[4]:
-                    return captured_unix - e[4]
-                return 0
-            e = min(candidates, key=capture_distance)
-        elif candidates:
-            e = min(candidates, key=lambda x: x[1] - x[0])
-        else:
-            e = epochs[-1]
+        ei = _pick_epoch(epochs, ds, captured_unix)
+        e = epochs[ei]
         if e[5]:
-            anchor_ds, anchor_unix = min(e[5], key=lambda a: abs(a[0] - ds))
+            anchors, dsl = prepared[ei]
+            anchor_ds, anchor_unix, _ = _nearest(anchors, dsl, ds)
             predicted = anchor_unix + (ds - anchor_ds) / 10.0
-            kind, pair = bracket(e[5], ds)
+            kind, pair = _bracket(anchors, dsl, ds)
             if kind == "stalled":
                 before, after = pair
                 late = after[1] - (after[0] - ds) / 10.0
@@ -115,9 +172,9 @@ def make_unix_s(epochs):
                 # Only borrow a boot's clock when this ds continues that boot's counter;
                 # a rebooted ring restarts near zero and must not be projected through an
                 # older boot that only ran at higher counts.
-                plausible = [unix + (ds - anchor_ds) / 10.0
-                             for epoch in epochs for anchor_ds, unix in epoch[5]
-                             if unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
+                plausible = [unix + (ds - a_ds) / 10.0
+                             for epoch in epochs for a_ds, unix in epoch[5]
+                             if unix + (ds - a_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
                              and epoch[0] - EPOCH_RESET_SLACK_DS <= ds <= epoch[1] + EPOCH_RESET_SLACK_DS]
                 if plausible:
                     return max(plausible)
@@ -133,15 +190,11 @@ def undated_reason(epochs, ds, captured_unix):
                   if e[0] - EPOCH_RESET_SLACK_DS <= ds <= e[1] + EPOCH_RESET_SLACK_DS]
     if not candidates:
         return "missing_anchor"
-    def capture_distance(e):
-        if captured_unix < e[3]:
-            return e[3] - captured_unix
-        if captured_unix > e[4]:
-            return captured_unix - e[4]
-        return 0
-    e = min(candidates, key=capture_distance)
+    ei = _pick_epoch(epochs, ds, captured_unix)
+    e = epochs[ei]
     if e[5]:
-        kind, pair = bracket(e[5], ds)
+        anchors, dsl = _prepared(epochs)[ei]
+        kind, pair = _bracket(anchors, dsl, ds)
         if kind == "erratic":
             return "accelerated_counter"
         if kind == "stalled":
@@ -150,12 +203,12 @@ def undated_reason(epochs, ds, captured_unix):
             if boots and min(boots) <= ds < max(boots):
                 return "ambiguous_reboot_stall"
             return None
-        anchor_ds, anchor_unix = min(e[5], key=lambda a: abs(a[0] - ds))
+        anchor_ds, anchor_unix, _ = _nearest(anchors, dsl, ds)
         if anchor_unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S:
             return None
-        if any(unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
+        if any(unix + (ds - a_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
                and epoch[0] - EPOCH_RESET_SLACK_DS <= ds <= epoch[1] + EPOCH_RESET_SLACK_DS
-               for epoch in epochs for anchor_ds, unix in epoch[5]):
+               for epoch in epochs for a_ds, unix in epoch[5]):
             return None
         return "accelerated_counter"
     return "missing_anchor"
