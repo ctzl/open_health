@@ -478,25 +478,40 @@ struct SummaryCache {
     db: PathBuf,
     tz: f64,
     serial: String, // the summary is per-ring; each ring caches separately
-    token: CacheToken, // (db, profile.json, feature_modes.json, bedtime_overrides.json) mtimes
+    token: CacheToken, // (db change-counter, profile.json, feature_modes.json, bedtime_overrides.json) mtimes
     value: Arc<Value>,
 }
 
 type CacheToken = (
-    Option<SystemTime>,
+    i64,
     Option<SystemTime>,
     Option<SystemTime>,
     Option<SystemTime>,
     i64,
 );
 
-/// mtimes of every input the summary depends on plus the store decoder version — any
-/// change rebuilds it. Covers a sync (oura.db), a profile edit (profile.json), a
-/// feature toggle (feature_modes.json), a manual bedtime adjustment
-/// (bedtime_overrides.json), and historical decode migrations.
+/// SQLite's change counter for the DB: bumps only when a connection commits a
+/// data change. The file mtime is NOT a safe proxy — any read-write open
+/// checkpoints the WAL and bumps mtime without changing data, which made the
+/// cache thrash (and re-ran every torch model) after each sync, live-HR
+/// session, or even the summary build's own migration probe.
+fn db_data_version(db: &Path) -> i64 {
+    rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|c| c.query_row("PRAGMA data_version", [], |r| r.get(0)))
+    .unwrap_or(0)
+}
+
+/// Change-counter of the DB plus mtimes of every sidecar input the summary
+/// depends on plus the store decoder version — any change rebuilds it. Covers a
+/// sync (oura.db), a profile edit (profile.json), a feature toggle
+/// (feature_modes.json), a manual bedtime adjustment (bedtime_overrides.json),
+/// and historical decode migrations.
 fn summary_token(db: &Path) -> CacheToken {
     (
-        mtime(db),
+        db_data_version(db),
         mtime(&profile_path(db)),
         mtime(&feature_modes_path(db)),
         mtime(&bedtime_overrides_path(db)),
@@ -539,43 +554,119 @@ fn resolve_summary_serial(db: &Path, want: Option<&str>) -> Result<String> {
 /// Cached `build_summary`: recompute only when oura.db, profile.json, or
 /// feature_modes.json changes. Keyed per ring, so switching rings in the UI
 /// doesn't evict the other ring's build (a handful of rings at most).
-fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<Arc<Value>> {
-    let _ = oura_store::storage::Store::migrate_if_writable(db);
+/// Keys with a background rebuild already in flight, so a polling client can't
+/// stack up duplicate model runs. Key is "db-path|serial" (tz is a float and
+/// can't hash; in practice one server serves one tz).
+fn recompute_in_flight() -> &'static Mutex<std::collections::HashSet<String>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn store_summary(
+    db: &Path,
+    tz: f64,
+    serial: &str,
+    token: CacheToken,
+    value: &Arc<Value>,
+) {
+    let mut guard = summary_cache().lock().unwrap();
+    // don't clobber a fresher entry a concurrent build already stored (compare
+    // the DB mtime, which a sync advances)
+    let newer_exists = guard
+        .iter()
+        .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
+    if !newer_exists {
+        guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
+        guard.push(SummaryCache {
+            db: db.to_path_buf(),
+            tz,
+            serial: serial.to_string(),
+            token,
+            value: value.clone(),
+        });
+    }
+}
+
+/// Cached `build_summary`. Returns `(value, recomputing)`: on a cache miss with a
+/// previous value on hand, the stale summary is served immediately and the rebuild
+/// happens on a background thread — the dashboard shows cached data while the
+/// torch models run instead of blocking the page for ~a minute. Only the very
+/// first request (nothing cached yet) builds synchronously.
+fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value>, bool)> {
     let serial = resolve_summary_serial(db, serial)?;
     let token = summary_token(db);
-    if let Some(c) = summary_cache()
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|c| c.db == db && c.tz == tz && c.serial == serial && c.token == token)
+    let key = format!("{}|{}", db.display(), serial);
     {
-        return Ok(c.value.clone());
+        let guard = summary_cache().lock().unwrap();
+        if let Some(c) = guard
+            .iter()
+            .find(|c| c.db == db && c.tz == tz && c.serial == serial && c.token == token)
+        {
+            return Ok((c.value.clone(), false));
+        }
+        // token mismatch but a previous build exists: serve it, rebuild in background
+        if let Some(stale) = guard
+            .iter()
+            .find(|c| c.db == db && c.tz == tz && c.serial == serial)
+        {
+            let value = stale.value.clone();
+            drop(guard);
+            let spawned = {
+                let mut inflight = recompute_in_flight().lock().unwrap();
+                inflight.insert(key.clone()) // false if a rebuild is already running
+            };
+            if spawned {
+                // RAII: clear the in-flight flag even if the build panics, so a
+                // later request can retry instead of serving stale forever.
+                struct InFlightGuard(String);
+                impl Drop for InFlightGuard {
+                    fn drop(&mut self) {
+                        recompute_in_flight().lock().unwrap().remove(&self.0);
+                    }
+                }
+                let (db2, tz2, serial2) = (db.to_path_buf(), tz, serial.clone());
+                std::thread::spawn(move || {
+                    let _guard = InFlightGuard(key);
+                    let started = std::time::Instant::now();
+                    let token_now = summary_token(&db2);
+                    match build_summary(&db2, tz2, Some(&serial2)) {
+                        Ok(v) => {
+                            let value = Arc::new(v);
+                            // if inputs changed again mid-build, skip caching: the next
+                            // request sees the mismatch and re-runs against new state
+                            if summary_token(&db2) == token_now {
+                                store_summary(&db2, tz2, &serial2, token_now, &value);
+                            }
+                            log_activity(
+                                "summary",
+                                "ok",
+                                &format!(
+                                    "background recompute finished in {} ms",
+                                    started.elapsed().as_millis()
+                                ),
+                            );
+                        }
+                        Err(e) => log_activity(
+                            "summary",
+                            "error",
+                            &format!("background recompute failed: {e}"),
+                        ),
+                    }
+                });
+            }
+            return Ok((value, true));
+        }
     }
-    // build outside the lock so concurrent first-loads don't serialise on it
+    // cold start: no previous value to fall back to, build synchronously
     let value = Arc::new(build_summary(db, tz, Some(&serial))?);
     // re-stat the inputs: if any changed while we were building (e.g. a sync landed),
     // the result may predate that change — don't cache it, so the next request
     // rebuilds against the new state instead of serving stale data.
     let token_after = summary_token(db);
     if token_after == token {
-        let mut guard = summary_cache().lock().unwrap();
-        // don't clobber a fresher entry a concurrent build already stored (compare
-        // the DB mtime, which a sync advances)
-        let newer_exists = guard
-            .iter()
-            .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
-        if !newer_exists {
-            guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
-            guard.push(SummaryCache {
-                db: db.to_path_buf(),
-                tz,
-                serial,
-                token,
-                value: value.clone(),
-            });
-        }
+        store_summary(db, tz, &serial, token, &value);
     }
-    Ok(value)
+    Ok((value, false))
 }
 
 pub async fn serve(
@@ -1009,12 +1100,25 @@ async fn handle(
         ("GET", "/api/summary") => {
             // building the summary shells out to torch models → off the async
             // executor; cached so only the first load (or post-sync/edit) pays for it.
+            // After that a stale value is served instantly while a background
+            // thread rebuilds — the page never blocks on the models.
             let serial = query_param(query, "serial");
-            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz, serial.as_deref()))
-                .await
-                .map_err(|e| anyhow!(e))?;
-            match body {
-                Ok(v) => json_resp(&mut sock, &v).await,
+            let built = tokio::task::spawn_blocking(move || {
+                cached_summary(&db, effective_tz, serial.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
+            match built {
+                Ok((mut v, recomputing)) => {
+                    if recomputing {
+                        // Arc::make_mut clones once (the cache keeps its copy); the
+                        // flag tells the page fresh numbers are on their way.
+                        if let Some(obj) = Arc::make_mut(&mut v).as_object_mut() {
+                            obj.insert("recomputing".into(), json!(true));
+                        }
+                    }
+                    json_resp(&mut sock, &v).await
+                }
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }

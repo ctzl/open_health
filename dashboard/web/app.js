@@ -2240,6 +2240,12 @@ function showLoadError(msg) {
 }
 
 let LOAD_SEQ = 0;
+// When the server serves a cached summary while rebuilding in the background it
+// sets `recomputing: true`. Poll a few times (the build takes ~1 min) so the
+// page swaps itself to fresh data without a manual refresh; capped so a broken
+// rebuild can't poll forever.
+let RECOMPUTE_POLL = null;
+let RECOMPUTE_TRIES = 0;
 async function load() {
   // guard against overlapping loads (sync/profile-save during an in-flight build):
   // a slower earlier response must not overwrite a newer one.
@@ -2276,6 +2282,20 @@ async function load() {
     p.classList.add("reveal");
     p.style.setProperty("--d", i * 60 + "ms");
   });
+  if (d.recomputing) {
+    // cached data is on screen; the server is rebuilding with the models right
+    // now. Poll until fresh numbers land (or give up) instead of leaving the
+    // page stale until the next manual refresh.
+    if (RECOMPUTE_TRIES === 0) toast("Showing cached data — models are recomputing…", "info");
+    if (++RECOMPUTE_TRIES <= 12) {
+      clearTimeout(RECOMPUTE_POLL);
+      RECOMPUTE_POLL = setTimeout(() => {
+        if (seq === LOAD_SEQ) load(); // stop if a newer load superseded this one
+      }, 8000);
+    }
+  } else {
+    RECOMPUTE_TRIES = 0; // fresh data landed (or nothing was recomputing)
+  }
 }
 
 // ── ring switcher ─────────────────────────────────────────
