@@ -317,6 +317,114 @@ fn run_py_json_stdin(
     run_py_json_stdin_optional(root, py, script, args, Some(input))
 }
 
+/// One model run in flight, shared by every caller asking for the identical
+/// invocation. Model runs take minutes; a second build for the same ring must
+/// not stack up a duplicate torch process — it joins this slot and reuses the
+/// result instead.
+#[derive(Default)]
+struct ModelSlot {
+    state: Mutex<(bool, Option<Value>)>, // (done, result)
+    cv: std::sync::Condvar,
+}
+
+impl ModelSlot {
+    fn publish(&self, result: Option<Value>) {
+        let mut s = self.state.lock().unwrap();
+        s.0 = true;
+        s.1 = result;
+        self.cv.notify_all();
+    }
+}
+
+fn model_slots() -> &'static Mutex<std::collections::HashMap<String, Arc<ModelSlot>>> {
+    static S: OnceLock<Mutex<std::collections::HashMap<String, Arc<ModelSlot>>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Dedup key for a model invocation: script + ring serial + exact inputs. The
+/// serial is what the runners filter events and key their caches by, so two
+/// rings' runs never collide; different inputs (tz, demographics, sleep
+/// ranges) hash apart and run independently. `None` (no guard) when the call
+/// carries no `--serial`.
+fn model_key(script: &str, args: &[String], input: Option<&[u8]>) -> Option<(String, String)> {
+    let serial = args.windows(2).find(|w| w[0] == "--serial")?.get(1)?.clone();
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    script.hash(&mut h);
+    args.hash(&mut h);
+    input.hash(&mut h);
+    Some((format!("{script}|{serial}|{:x}", h.finish()), serial))
+}
+
+/// Removes the slot from the registry and wakes any joiners even if the run
+/// panics, so a later call can claim a fresh slot.
+struct SlotGuard {
+    key: String,
+    slot: Arc<ModelSlot>,
+    published: bool,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            self.slot.publish(None);
+        }
+        model_slots().lock().unwrap().remove(&self.key);
+    }
+}
+
+/// Runs `run` under the in-flight guard for `key`: the first caller executes it
+/// and publishes the result; concurrent callers with the same key wait on the
+/// slot and reuse it instead of starting a duplicate model process. Bounded —
+/// if the owner somehow never finishes, joiners degrade like a failed model
+/// would. Extracted from `run_py_json_stdin_optional` so it can be tested
+/// without spawning Python.
+fn dedup_model_run<F>(script: &str, serial: &str, key: String, run: F) -> Option<Value>
+where
+    F: FnOnce() -> Option<Value>,
+{
+    let (slot, owner) = {
+        let mut slots = model_slots().lock().unwrap();
+        match slots.get(&key).cloned() {
+            Some(existing) => (existing, false),
+            None => {
+                let slot = Arc::new(ModelSlot::default());
+                slots.insert(key.clone(), slot.clone());
+                (slot, true)
+            }
+        }
+    };
+    if !owner {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        let mut state = slot.state.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (g, _) = slot.cv.wait_timeout(state, remaining).unwrap();
+            state = g;
+        }
+        let done = state.0;
+        let result = state.1.clone();
+        drop(state);
+        log_activity(
+            "model",
+            if done { "joined" } else { "join-timeout" },
+            &format!(
+                "{script}: {} (ring {serial})",
+                if done { "reused in-flight run" } else { "in-flight run never finished" }
+            ),
+        );
+        return result;
+    }
+    let mut guard = SlotGuard { key, slot, published: false };
+    let result = run();
+    guard.slot.publish(result.clone());
+    guard.published = true;
+    result
+}
+
 fn run_py_json_stdin_optional(
     root: &Path,
     py: &Path,
@@ -324,9 +432,15 @@ fn run_py_json_stdin_optional(
     args: &[String],
     input: Option<&[u8]>,
 ) -> Option<Value> {
-    let mut command = Command::new(py);
-    command.current_dir(root).arg(root.join(script)).args(args);
-    model_output(command, input, std::time::Duration::from_secs(180), script)
+    let run = || {
+        let mut command = Command::new(py);
+        command.current_dir(root).arg(root.join(script)).args(args);
+        model_output(command, input, std::time::Duration::from_secs(180), script)
+    };
+    match model_key(script, args, input) {
+        Some((key, serial)) => dedup_model_run(script, &serial, key, run),
+        None => run(),
+    }
 }
 
 /// The web dashboard's [`ModelRunner`]: shells out to the Python torch runners,
@@ -1657,6 +1771,63 @@ fn run_feature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_key_requires_serial_and_separates_rings() {
+        let args = |serial: &str| {
+            vec!["db".to_string(), "--json".into(), "--serial".into(), serial.into()]
+        };
+        // no --serial: unguarded (returns None)
+        assert!(model_key("s.py", &["db".into(), "--json".into()], None).is_none());
+        let a = model_key("s.py", &args("AAA"), None).unwrap().0;
+        let b = model_key("s.py", &args("BBB"), None).unwrap().0;
+        assert_ne!(a, b, "different rings must not share a slot");
+        // same invocation -> same key; different inputs -> different key
+        assert_eq!(a, model_key("s.py", &args("AAA"), None).unwrap().0);
+        assert_ne!(a, model_key("s.py", &args("AAA"), Some(b"win1")).unwrap().0);
+        assert_ne!(
+            a,
+            model_key("other.py", &args("AAA"), None).unwrap().0,
+            "different scripts must not share a slot"
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_runs_execute_once_and_share_the_result() {
+        let key = format!("dedup-test-{}", std::process::id());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx = Arc::new(tx);
+
+        let spawn = |rx_done: bool| {
+            let runs = runs.clone();
+            let key = key.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                dedup_model_run("t.py", "RING", key, || {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tx.send(()).ok(); // owner is inside the run
+                    if rx_done {
+                        // hold the slot until the joiner has arrived
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                    Some(json!({"ok": true}))
+                })
+            })
+        };
+        let owner = spawn(true);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); // owner running
+        let joiner = spawn(false);
+        let a = owner.join().unwrap();
+        let b = joiner.join().unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "model ran twice");
+        assert_eq!(a, b);
+        assert_eq!(a.unwrap()["ok"], true);
+
+        // the slot is released afterwards: a later call runs again
+        let c = dedup_model_run("t.py", "RING", key, || Some(json!({"ok": "second"})));
+        assert_eq!(c.unwrap()["ok"], "second");
+    }
 
     #[test]
     fn fallback_fills_only_null_nights_and_keeps_python_stages() {
