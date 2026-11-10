@@ -2125,7 +2125,13 @@ pub fn build_summary(
     });
     let db = db_abs.as_path();
     let demo = read_profile(db);
-    let _ = Store::migrate_if_writable(db);
+    // Only open the DB read-write when a decode migration is actually pending.
+    // migrate_if_writable otherwise checkpoints the WAL and bumps the DB mtime,
+    // which silently invalidates the dashboard's mtime-keyed summary cache and
+    // re-runs every torch model on the next request.
+    if Store::needs_migration(db) {
+        let _ = Store::migrate_if_writable(db);
+    }
     let store = Store::open_read_only(db).context("opening DB")?;
     let serial = resolve_summary_serial(&store, serial)?;
     let ring_name = store.ring_name(&serial)?.unwrap_or_else(|| serial.clone());

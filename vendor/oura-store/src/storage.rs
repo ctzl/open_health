@@ -616,6 +616,34 @@ impl Store {
         Ok(self.decoder_version()? < DECODER_VERSION)
     }
 
+    /// Whether a decode migration is pending, answered from a read-only open.
+    /// Lets callers skip `migrate_if_writable` — its read-write open checkpoints
+    /// the WAL and bumps the DB mtime, which would invalidate any mtime-keyed
+    /// cache of derived data for no reason when there is nothing to migrate.
+    pub fn needs_migration<P: AsRef<Path>>(path: P) -> bool {
+        let Ok(conn) = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        let store = Self { conn };
+        if !store
+            .get_meta("redecode_cursor_id")
+            .map(|v| v.is_some())
+            .unwrap_or(false)
+        {
+            if store
+                .decoder_version()
+                .map(|v| v >= DECODER_VERSION)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn ensure_decoder_version(&self) -> Result<()> {
         if !self.needs_decoder_migration()? {
             return Ok(());
