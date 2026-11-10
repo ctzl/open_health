@@ -97,12 +97,13 @@ let REPORT = null;
 async function boot() {
   $("import-btn").addEventListener("click", onImportClick);
   $("marker-dialog").addEventListener("click", (e) => { if (e.target.id === "marker-dialog") $("marker-dialog").close(); });
+  await initProfileSwitcher();
   await loadReport();
 }
 
 async function loadReport() {
   try {
-    const d = await (await fetch("/api/blood/report", { headers: { "X-Oura-Dash": "1" } })).json();
+    const d = await (await fetch(profileUrl("/api/blood/report"), { headers: { "X-Oura-Dash": "1" } })).json();
     REPORT = d;
     if (d.error) { showError(d.error); return; }
     $("source-tag").textContent = d.mocked ? "sample panel" : `${d.source || "pdf"} · ${d.summary.imports} reports`;
@@ -130,7 +131,7 @@ async function onImportClick() {
     const res = await fetch("/api/blood/import-dir", {
       method: "POST",
       headers: { "X-Oura-Dash": "1", "Content-Type": "application/json" },
-      body: "{}",
+      body: JSON.stringify({ serial: PROFILE_SERIAL || "" }),
     });
     const d = await res.json();
     if (!d.ok && d.message) {
@@ -168,8 +169,32 @@ function renderImports(imports) {
       h("span", { class: "bl-imp-name" }, im.file),
       h("span", { class: "bl-imp-date" }, fmtDate(im.date)),
       h("span", { class: "bl-imp-meta" }, `${im.markers} markers · ${im.lab || "lab"} · ${im.status || "ok"} · ${fmtSize(im.size)}`),
-      ...(im.warnings && im.warnings.length ? [h("span", { class: "bl-imp-warn" }, im.warnings.join("; "))] : [])));
+      ...(im.warnings && im.warnings.length ? [h("span", { class: "bl-imp-warn" }, im.warnings.join("; "))] : []),
+      ...(PROFILE_RINGS.length >= 2 ? [assignControl(im)] : [])));
   });
+}
+
+// Per-report profile picker (docs/profiles.md): moves the import's rows to
+// another profile via POST /api/blood/assign.
+function assignControl(im) {
+  const sel = h("select", { class: "bl-assign", title: "Assign this report to a profile" });
+  const opts = [{ serial: "", name: "unassigned" }, ...PROFILE_RINGS];
+  for (const r of opts) {
+    const o = h("option", { value: r.serial }, r.name);
+    if ((im.serial || "") === r.serial) o.selected = true;
+    sel.append(o);
+  }
+  sel.addEventListener("change", async () => {
+    const res = await fetch("/api/blood/assign", {
+      method: "POST",
+      headers: { "X-Oura-Dash": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ sha: im.sha, serial: sel.value }),
+    });
+    const d = await res.json();
+    if (d.ok) await loadReport();
+    else { sel.title = d.message || "assign failed"; sel.disabled = true; }
+  });
+  return sel;
 }
 
 // ── attention (flagged) ───────────────────────────────────────────────────────
