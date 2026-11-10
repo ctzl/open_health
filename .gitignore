@@ -18,6 +18,11 @@ notes/models/
 *.ptl
 *.pth
 *.onnx
+
+# Incremental-recompute sidecar caches (regenerable; derived from the db).
+*.inc.json
+*.units.json
+*.skel.pkl
 *.mlmodel
 
 # iOS build artifacts generated locally by xcodegen / build scripts.
