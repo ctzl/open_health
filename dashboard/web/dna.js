@@ -51,17 +51,23 @@ const state = {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  await initProfileSwitcher();
   await refreshFiles(true);
-  $("file").addEventListener("change", () => { state.genome = $("file").value; loadReport(); });
+  $("file").addEventListener("change", () => { state.genome = $("file").value; syncDnaAssign(); loadReport(); });
   $("q-btn").addEventListener("click", runLookup);
   $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") runLookup(); });
   $("add-form").addEventListener("submit", (e) => { e.preventDefault(); fetchPgs(); });
+  const da = $("dna-assign");
+  if (da) da.addEventListener("change", async () => {
+    await postDash("/api/dna/assign", { filename: state.genome, serial: da.value });
+    await refreshFiles(false);
+  });
 }
 
 // Load the genome + score lists. On first call, default-select the built-ins.
 async function refreshFiles(initial) {
   try {
-    const d = await (await getDash("/api/dna/files")).json();
+    const d = await (await getDash(profileUrl("/api/dna/files"))).json();
     const genomes = d.genomes || [];
     const dir = d.genomes_dir;
     state.available = d.scores || [];
@@ -70,12 +76,16 @@ async function refreshFiles(initial) {
     const KIND_TAG = { cnv: " · CNV (not scoreable)", sv: " · SV (not scoreable)" };
     const sel = clear($("file"));
     if (genomes.length) {
-      for (const g of genomes) sel.append(h("option", { value: g.name }, `${g.name} · ${fmtSize(g.size)}${KIND_TAG[g.kind] || ""}`));
+      for (const g of genomes) {
+        const who = g.serial ? ` · ${profileName(g.serial)}` : "";
+        sel.append(h("option", { value: g.name }, `${g.name} · ${fmtSize(g.size)}${KIND_TAG[g.kind] || ""}${who}`));
+      }
       // prefer a scoreable (SNP/indel) file; only fall back to a CNV/SV if that's all there is
       const firstScoreable = genomes.find((g) => g.scoreable);
       if (!state.genome || !genomes.some((g) => g.name === state.genome)) state.genome = (firstScoreable || genomes[0]).name;
       sel.value = state.genome;
       $("genome-dir").textContent = dir ? `${genomes.length} in ${dir}` : `${genomes.length} file${genomes.length === 1 ? "" : "s"}`;
+      syncDnaAssign();
     } else {
       sel.append(h("option", null, "no genome files"));
       $("genome-dir").textContent = dir ? `none in ${dir}` : "";
@@ -104,6 +114,24 @@ async function refreshFiles(initial) {
 function showEmpty(msg) {
   clear($("scores"));
   clear($("traits")).append(h("div", { class: "error", html: msg || "No genome files found." }));
+}
+
+// ── genome → profile assignment (docs/profiles.md) ────────────────────────────
+// Mirrors the ring switcher for DNA files: pick the genome in #file, pick a
+// profile here; the choice persists in the store (dna_assignments table).
+function syncDnaAssign() {
+  const ctl = document.getElementById("dna-assign-ctl");
+  if (!ctl) return;
+  if (PROFILE_RINGS.length < 2) { ctl.hidden = true; return; }
+  ctl.hidden = false;
+  const sel = clear($("dna-assign"));
+  const g = (state.genomes || []).find((x) => x.name === state.genome);
+  const cur = (g && g.serial) || "";
+  for (const r of [{ serial: "", name: "unassigned" }, ...PROFILE_RINGS]) {
+    const o = h("option", { value: r.serial }, r.name);
+    if (cur === r.serial) o.selected = true;
+    sel.append(o);
+  }
 }
 
 // ── score picker (the selector) ──────────────────────────────────────────────

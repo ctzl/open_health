@@ -34,6 +34,7 @@ const DNA_CSS: &str = include_str!("../../../dashboard/web/dna.css");
 const BLOOD_HTML: &str = include_str!("../../../dashboard/web/blood.html");
 const BLOOD_JS: &str = include_str!("../../../dashboard/web/blood.js");
 const BLOOD_CSS: &str = include_str!("../../../dashboard/web/blood.css");
+const PROFILE_JS: &str = include_str!("../../../dashboard/web/profile.js");
 const LOGS_HTML: &str = include_str!("../../../dashboard/web/logs.html");
 const LOGS_JS: &str = include_str!("../../../dashboard/web/logs.js");
 const LOGS_CSS: &str = include_str!("../../../dashboard/web/logs.css");
@@ -799,6 +800,28 @@ pub async fn serve(
     }
     // replay the persisted activity log (activity_log.jsonl next to the DB)
     init_activity_log(&db);
+    // Profiles (docs/profiles.md): legacy blood rows (serial='') belong to the
+    // primary ring — reassign once at startup so the first profile shows them.
+    {
+        let db = db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            oura_store::storage::Store::open_read_only(&db)
+                .and_then(|s| s.list_rings())
+                .ok()
+                .and_then(|rings| {
+                    rings.iter().min_by_key(|r| r.3).map(|r| r.0.clone())
+                })
+                .map(|primary| crate::blood::backfill_serial(&primary))
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(v) = res {
+            let n = v["reassigned"].as_i64().unwrap_or(0);
+            if n > 0 {
+                println!("blood: reassigned {n} legacy import(s) to the primary ring");
+            }
+        }
+    }
     let bind_ip = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let listener = TcpListener::bind((bind_ip, port))
         .await
@@ -960,6 +983,8 @@ async fn handle(
             | ("POST", "/api/dna/fetch")
             | ("POST", "/api/blood/import-dir")
             | ("POST", "/api/blood/import")
+            | ("POST", "/api/blood/assign")
+            | ("POST", "/api/dna/assign")
             | ("POST", "/api/logs/clear")
     ) && !csrf_ok;
     if forbid {
@@ -1066,6 +1091,15 @@ async fn handle(
             )
             .await
         }
+        (_, "/profile.js") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/javascript; charset=utf-8",
+                &asset("profile.js", PROFILE_JS),
+            )
+            .await
+        }
         (_, "/blood.css") => {
             write_resp(
                 &mut sock,
@@ -1118,13 +1152,19 @@ async fn handle(
             json_resp(&mut sock, &json!({ "ok": true })).await
         }
         ("GET", "/api/blood/report") => {
-            let v = tokio::task::spawn_blocking(crate::blood::report)
-                .await
-                .map_err(|e| anyhow!(e))?;
+            let serial = query_param(query, "serial").unwrap_or_default();
+            let v = tokio::task::spawn_blocking(move || {
+                crate::blood::report((!serial.is_empty()).then_some(serial.as_str()))
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
             json_resp(&mut sock, &v).await
         }
         ("POST", "/api/blood/import-dir") => {
-            let v = tokio::task::spawn_blocking(crate::blood::import_dir)
+            let req =
+                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let serial = req["serial"].as_str().unwrap_or("").to_string();
+            let v = tokio::task::spawn_blocking(move || crate::blood::import_dir(&serial))
                 .await
                 .map_err(|e| anyhow!(e))?;
             json_resp(&mut sock, &v).await
@@ -1133,7 +1173,18 @@ async fn handle(
             let req =
                 serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let path = req["path"].as_str().unwrap_or("").to_string();
-            let v = tokio::task::spawn_blocking(move || crate::blood::import_path(&path))
+            let serial = req["serial"].as_str().unwrap_or("").to_string();
+            let v = tokio::task::spawn_blocking(move || crate::blood::import_path(&path, &serial))
+                .await
+                .map_err(|e| anyhow!(e))?;
+            json_resp(&mut sock, &v).await
+        }
+        ("POST", "/api/blood/assign") => {
+            let req =
+                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let sha = req["sha"].as_str().unwrap_or("").to_string();
+            let serial = req["serial"].as_str().unwrap_or("").to_string();
+            let v = tokio::task::spawn_blocking(move || crate::blood::assign(&sha, &serial))
                 .await
                 .map_err(|e| anyhow!(e))?;
             json_resp(&mut sock, &v).await
@@ -1142,6 +1193,62 @@ async fn handle(
             let v = tokio::task::spawn_blocking(crate::dna::list_files)
                 .await
                 .map_err(|e| anyhow!(e))?;
+            // Profiles (docs/profiles.md): hide genome files assigned to another
+            // profile; unassigned files stay visible to everyone.
+            let serial = query_param(query, "serial").unwrap_or_default();
+            let v = if v.is_object() && !serial.is_empty() {
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || {
+                    let assign = oura_store::storage::Store::open_read_only(&db)
+                        .and_then(|s| s.list_dna_assignments())
+                        .unwrap_or_default();
+                    let mut v = v;
+                    if let Some(list) = v["genomes"].as_array_mut() {
+                        list.retain(|g| match assign.get(g["name"].as_str().unwrap_or("")) {
+                            Some(owner) => *owner == serial,
+                            None => true,
+                        });
+                        for g in list.iter_mut() {
+                            let name = g["name"].as_str().unwrap_or("").to_string();
+                            if let Some(obj) = g.as_object_mut() {
+                                obj.insert(
+                                    "serial".into(),
+                                    Value::String(
+                                        assign.get(name.as_str()).cloned().unwrap_or_default(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    v
+                })
+                .await
+                .map_err(|e| anyhow!(e))?
+            } else {
+                v
+            };
+            json_resp(&mut sock, &v).await
+        }
+        ("POST", "/api/dna/assign") => {
+            let req =
+                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let filename = req["filename"].as_str().unwrap_or("").to_string();
+            let serial = req["serial"].as_str().unwrap_or("").to_string();
+            if filename.is_empty() {
+                return json_resp(&mut sock, &json!({"ok": false, "message": "filename required"}))
+                    .await;
+            }
+            let db2 = db.clone();
+            let v = tokio::task::spawn_blocking(move || {
+                match oura_store::storage::Store::open(&db2)
+                    .and_then(|s| s.set_dna_assignment(&filename, &serial))
+                {
+                    Ok(()) => json!({"ok": true}),
+                    Err(e) => json!({"ok": false, "message": e.to_string()}),
+                }
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
             json_resp(&mut sock, &v).await
         }
         ("GET", "/api/dna/report") => {

@@ -18,6 +18,7 @@
         <span class="dna-sub">DNA explorer</span>
       </div>
       <div class="actions">
+        <select class="bl-profile-sel" id="profile-sel" hidden aria-label="Profile"></select>
         <a class="action" href="/" title="Back to dashboard">
           <span class="ic" style="--i:url(/icons/arrow-left.svg)"></span>
           <span>Dashboard</span>
@@ -38,6 +39,10 @@
           <label class="dna-ctl-label" for="file">Genome</label>
           <select id="file" class="dna-select" aria-label="Genome file"></select>
           <span class="dna-hint" id="genome-dir"></span>
+        </div>
+        <div class="dna-ctl" id="dna-assign-ctl" hidden>
+          <label class="dna-ctl-label" for="dna-assign">Genome belongs to</label>
+          <select id="dna-assign" class="dna-select" aria-label="Assign genome to profile"></select>
         </div>
         <div class="dna-ctl dna-ctl-grow">
           <div class="dna-ctl-label-row">
@@ -90,6 +95,7 @@
     </footer>
   </div>
 
+  <script src="/profile.js"></script>
   <script src="/dna.js"></script>
 </body>
 </html>

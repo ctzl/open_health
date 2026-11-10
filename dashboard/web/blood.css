@@ -160,3 +160,17 @@
 .bl-vval { font: 540 13px/1 var(--mono); color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
 .bl-vtag { justify-self: end; }
 .bl-vtag .pill { font-size: 10px; }
+
+/* profile switcher + per-report assignment (docs/profiles.md) */
+.bl-profile-sel {
+  font: 540 13px/1 var(--sans); color: var(--text);
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 10px; max-width: 220px;
+}
+.bl-profile-sel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bl-assign {
+  margin-left: auto; font: 400 11px/1 var(--mono); color: var(--muted);
+  background: transparent; border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 6px; max-width: 150px;
+}
+.bl-assign:hover { border-color: var(--accent); color: var(--text); }
