@@ -11,7 +11,9 @@ detect its calling convention from the loaded schema (3.1.15 replaced the three
 scalar settings tensors with an optional `global_settings`).
 """
 import argparse
+import calendar
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -25,6 +27,7 @@ import torch
 from _common import resolve_db, resolve_models_dir
 from activity_features import decoder_to_aad, unpack_real_step
 from epoch_time import build_epochs, is_dated, make_unix_s
+from event_cache import EventSource, UnitCache, _pred
 
 warnings.filterwarnings("ignore", message=".*searchsorted.*")
 
@@ -80,7 +83,9 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--min-duration", type=float, default=10.0,
                         help="Minimum segment minutes; Android default is 10")
-    parser.add_argument("--date", help="Only process one local day (YYYY-MM-DD)")
+    parser.add_argument("--date", help="Only process one local day (YYYY-MM-DD).")
+    parser.add_argument("--full", action="store_true",
+                        help="Ignore incremental state and recompute every day.")
     parser.add_argument("--no-stepmotion", action="store_true", help="Diagnostic fallback without gait")
     parser.add_argument("--serial", default=None, help="Only this ring's events (multi-ring DBs).")
     parser.add_argument("--json", action="store_true")
@@ -176,6 +181,10 @@ def decode_stepmotion(db, unix_seconds, enabled, epochs, serial=None):
         + " ORDER BY captured_unix,id",
         (serial,) if serial else (),
     ).fetchall()
+    return decode_step_packets(packets, unix_seconds, epochs, decoder)
+
+
+def decode_step_packets(packets, unix_seconds, epochs, decoder):
     seconds = {}
     for ds, tag, body, captured in packets:
         if tag == 0x7F and len(body) == 14 and is_dated(epochs, ds, captured):
@@ -269,23 +278,15 @@ def run_day(model, day, day_start_min, signals, steps, args):
     return sessions
 
 
-def main():
-    args = parse_args()
-    db_path = resolve_db(args.db, REPO)
-    if not MODEL.exists():
-        sys.exit(f"error: model not found: {MODEL}")
-    db = sqlite3.connect(str(db_path))
-    rows = db.execute(
-        "SELECT ring_timestamp,tag,decoded_json,captured_unix FROM events "
-        "WHERE decoded_json IS NOT NULL"
-        + (" AND serial = ?" if args.serial else "")
-        + " ORDER BY captured_unix,id",
-        (args.serial,) if args.serial else (),
-    ).fetchall()
-    if not rows:
-        sys.exit(f"error: no decoded events in {db_path}")
-    epochs = build_epochs(rows)
-    unix_seconds = make_unix_s(epochs)
+WHERE = "decoded_json IS NOT NULL"
+SIGNAL_TAGS = (0x50, 0x47, 0x46, 0x80)
+STEP_TAGS = (126, 127)
+STATE_VERSION = "activity-inc-2"
+
+
+def build_signals(rows, epochs, unix_seconds):
+    """Date every row through the clock and bucket it into the per-minute
+    signal series the Android TimeseriesDb tables would have held."""
     signals = {name: [] for name in ("met", "motion", "temperature", "heart_rate")}
     scale = float(os.environ.get("ACM_SCALE", "1"))
     for ds, tag, payload, captured in rows:
@@ -313,34 +314,147 @@ def main():
         elif tag == 0x80 and value.get("hr_bpm"):
             bpm = value["hr_bpm"]
             signals["heart_rate"].append((minute, [sum(bpm) / len(bpm)]))
-    if not signals["met"]:
-        sys.exit("no MET events in DB — cannot run activity model")
+    return signals
 
-    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion, epochs, args.serial)
-    # Demographics from profile.json next to the DB (what the iOS app and the CVA
-    # runner use); the model takes [age, sex(M=1), height_m, weight_kg].
-    profile = {}
+
+def profile_vector(db_path):
+    """Demographics from profile.json next to the DB (what the iOS app and the CVA
+    runner use); the model takes [age, sex(M=1), height_m, weight_kg]."""
     try:
         profile = json.loads((Path(db_path).parent / "profile.json").read_text())
     except Exception:
-        pass
-    args.user_vector = [float(profile.get("age") or 30), 1.0 if str(profile.get("sex", "M")).upper() == "M" else 0.0,
-                        float(profile.get("height_m") or 1.78), float(profile.get("weight_kg") or 75)]
-    offset_minutes = args.tz * 60
+        profile = {}
+    return [float(profile.get("age") or 30),
+            1.0 if str(profile.get("sex", "M")).upper() == "M" else 0.0,
+            float(profile.get("height_m") or 1.78), float(profile.get("weight_kg") or 75)]
+
+
+def local_day(unix, tz):
+    return datetime.datetime.utcfromtimestamp(unix + tz * 3600).date().isoformat()
+
+
+def step_decoder_path():
+    if STEP_MODEL and STEP_MODEL.exists():
+        return str(STEP_MODEL)
+    if STEP_MODEL_MOBILE.exists():
+        return str(STEP_MODEL_MOBILE)
+    return None
+
+
+def run_one_day(args, model, day, signals, steps):
+    utc_midnight = (datetime.datetime.combine(day, datetime.time())
+                    - datetime.timedelta(minutes=args.tz * 60))
+    day_start_min = utc_midnight.replace(tzinfo=datetime.timezone.utc).timestamp() / 60
+    try:
+        return run_day(model, day, day_start_min, signals, steps, args)
+    except (torch.jit.Error, RuntimeError) as error:
+        if args.verbose:
+            print(f"{day}: model rejected incomplete day ({error})", file=sys.stderr)
+        return []
+
+
+def run_full(args, db_path, model, units, src):
+    """Cold path: read everything, run every day, commit the watermark. This is
+    the reference the incremental path must match (test_event_cache.py)."""
+    db = sqlite3.connect(str(db_path))
+    rows = db.execute(
+        "SELECT ring_timestamp,tag,decoded_json,captured_unix FROM events "
+        "WHERE " + WHERE
+        + (" AND serial = ?" if args.serial else "")
+        + " ORDER BY captured_unix,id",
+        (args.serial,) if args.serial else (),
+    ).fetchall()
+    if not rows:
+        sys.exit(f"error: no decoded events in {db_path}")
+    epochs = build_epochs(rows)
+    unix_seconds = make_unix_s(epochs)
+    signals = build_signals(rows, epochs, unix_seconds)
+    if not signals["met"]:
+        sys.exit("no MET events in DB — cannot run activity model")
+    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion, epochs, args.serial)
     dates = sorted({datetime.datetime.utcfromtimestamp(t * 60 + args.tz * 3600).date()
                     for t, _ in signals["met"]})
-    if args.date:
-        dates = [datetime.date.fromisoformat(args.date)]
-    model = torch.jit.load(str(MODEL), map_location="cpu").eval()
+    units.clear()
     sessions = []
     for day in dates:
-        utc_midnight = datetime.datetime.combine(day, datetime.time()) - datetime.timedelta(minutes=offset_minutes)
-        day_start_min = utc_midnight.replace(tzinfo=datetime.timezone.utc).timestamp() / 60
-        try:
-            sessions.extend(run_day(model, day, day_start_min, signals, steps, args))
-        except (torch.jit.Error, RuntimeError) as error:
-            if args.verbose:
-                print(f"{day}: model rejected incomplete day ({error})", file=sys.stderr)
+        day_sessions = run_one_day(args, model, day, signals, steps)
+        units.set(day.isoformat(), day_sessions)
+        sessions.extend(day_sessions)
+    units.save()
+    src.note_epochs(epochs)
+    src.commit(epochs, src.max_id(WHERE))
+    return sessions
+
+
+def run_incremental(args, db_path, model, units, src, epochs, tail, force_day=None):
+    """Warm path: only days whose inputs changed (new rows, or a boot that gained
+    clock anchors since the last commit) are recomputed; every other day comes
+    from the unit cache. Output equals run_full() on the same data."""
+    unix_seconds = make_unix_s(epochs)
+    dirty = set()
+    # Signal rows and step packets are separate row sets (step packets carry no
+    # decoded_json); either can dirty a day.
+    for where in (WHERE, "tag IN (126,127) AND body IS NOT NULL"):
+        for ds, tag, _payload, captured in src.new_rows(where):
+            if is_dated(epochs, ds, captured):
+                dirty.add(local_day(unix_seconds(ds, captured), args.tz))
+    for i, lo, hi in tail:
+        u0, u1 = sorted((_pred(epochs[i], lo), _pred(epochs[i], hi)))
+        day = datetime.date.fromisoformat(local_day(u0, args.tz))
+        last = local_day(u1, args.tz)
+        while day.isoformat() <= last:
+            dirty.add(day.isoformat())
+            day += datetime.timedelta(days=1)
+    if force_day:
+        dirty.add(force_day)
+    decoder = None if args.no_stepmotion else load_step_decoder()
+    sessions = []
+    for key in sorted(set(units.days()) | dirty):
+        if key not in dirty:
+            sessions.extend(units.get(key))
+            continue
+        day = datetime.date.fromisoformat(key)
+        u0 = calendar.timegm(day.timetuple()) - int(args.tz * 3600)
+        windows = src.ds_windows(u0, u0 + 86400, epochs)
+        rows = src.rows_in_windows(windows, SIGNAL_TAGS, where_extra=WHERE)
+        signals = build_signals(rows, epochs, unix_seconds)
+        steps = []
+        if decoder is not None:
+            packets = src.rows_in_windows(
+                windows, STEP_TAGS, columns="id,ring_timestamp,tag,body,captured_unix",
+                where_extra="body IS NOT NULL")
+            steps = decode_step_packets(packets, unix_seconds, epochs, decoder)
+        day_sessions = run_one_day(args, model, day, signals, steps)
+        units.set(key, day_sessions)
+        sessions.extend(day_sessions)
+    units.save()
+    if not force_day:
+        src.commit(epochs, src.max_id(WHERE))
+    return sessions
+
+
+def main():
+    args = parse_args()
+    db_path = resolve_db(args.db, REPO)
+    if not MODEL.exists():
+        sys.exit(f"error: model not found: {MODEL}")
+    args.user_vector = profile_vector(db_path)
+    fp = hashlib.sha256(json.dumps([
+        STATE_VERSION, MODEL.name, MODEL_VERSION, args.threshold, args.min_duration,
+        args.user_vector, args.tz, args.no_stepmotion, os.environ.get("ACM_SCALE", "1"),
+        None if args.no_stepmotion else step_decoder_path(),
+    ]).encode()).hexdigest()
+    src = EventSource(db_path, args.serial, "activity", STATE_VERSION)
+    units = UnitCache(db_path, "activity", args.serial, fp)
+    model = torch.jit.load(str(MODEL), map_location="cpu").eval()
+    if args.full or not src.state["epochs"] or not units.units:
+        sessions = run_full(args, db_path, model, units, src)
+    else:
+        epochs, tail = src.clock(WHERE)
+        sessions = run_incremental(args, db_path, model, units, src, epochs, tail,
+                                  force_day=args.date)
+    if args.date:
+        sessions = [s for s in sessions if s["start"].startswith(args.date)]
     result = {"model": MODEL_VERSION, "pipeline": "android-parity", "sessions": sessions}
     if args.json:
         print(json.dumps(result, indent=2))
