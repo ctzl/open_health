@@ -2082,6 +2082,7 @@ async function saveProfile(e) {
     height_m: +$("f-height").value,
     weight_kg: +$("f-weight").value,
     ring_size: (CURRENT_PROFILE && CURRENT_PROFILE.ring_size) || 10, // not on the ring; kept default
+    serial: CURRENT_SERIAL || "", // details are per-ring (profile.json is serial-keyed)
   };
   $("profile-save").disabled = true;
   try {

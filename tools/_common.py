@@ -2,9 +2,31 @@
 run_sleep_model). Imported as a sibling module — each runner's directory is on
 sys.path[0] when invoked as `python tools/run_*.py`.
 """
+import json
 import os
 import sys
 from pathlib import Path
+
+
+def read_profile(db_path, serial=None):
+    """Demographics from `profile.json` next to the DB, for one ring.
+
+    `profile.json` is a map of ring serial -> demographics (the dashboard is
+    two-person); the `""` key is the default, used for unassigned requests and
+    as the fallback for rings with no entry of their own. A legacy flat
+    single-object file (pre-profiles) is treated as that default. Returns a
+    plain dict of {sex, age, height_m, weight_kg, ring_size}; empty if absent.
+    """
+    try:
+        data = json.loads((Path(db_path).parent / "profile.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if "age" in data or "sex" in data:  # legacy flat object = the only profile
+        return data
+    entry = data.get(serial or "") or data.get("") or {}
+    return entry if isinstance(entry, dict) else {}
 
 
 def resolve_models_dir(repo, required=None):

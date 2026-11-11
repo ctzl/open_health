@@ -114,22 +114,60 @@ impl ModelRunner for NoModelRunner {
 pub fn profile_path(db: &Path) -> PathBuf {
     db.parent().unwrap_or(Path::new(".")).join("profile.json")
 }
-/// Read the user profile (defaults if absent or malformed).
-pub fn read_profile(db: &Path) -> Demographics {
+
+/// `profile.json` is a map of ring serial → demographics (docs/profiles.md):
+/// age/sex/height/weight tune the CVA model, and on a two-ring dashboard each
+/// ring belongs to a different person. The `""` entry is the default — used
+/// for unassigned requests and as the fallback for rings with no entry.
+/// Legacy single-object files (pre-profiles) are migrated on read.
+fn read_profiles(db: &Path) -> serde_json::Map<String, Value> {
     std::fs::read_to_string(profile_path(db))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .map(|v| Demographics::from_json(&v))
+        .and_then(|v| match v {
+            Value::Object(mut m) => {
+                if m.contains_key("sex") || m.contains_key("age") {
+                    // legacy flat object: it was the only profile, so it is the default
+                    let flat = Value::Object(m.clone());
+                    m.clear();
+                    m.insert(String::new(), flat);
+                }
+                Some(m)
+            }
+            _ => None,
+        })
         .unwrap_or_default()
 }
-pub fn write_profile(db: &Path, v: &Value) -> Result<Demographics> {
+
+/// Read the demographics for `serial`, falling back to the `""` default entry.
+pub fn read_profile_for(db: &Path, serial: &str) -> Demographics {
+    let profiles = read_profiles(db);
+    profiles
+        .get(serial)
+        .or_else(|| profiles.get(""))
+        .map(|v| Demographics::from_json(v))
+        .unwrap_or_default()
+}
+
+/// Write the demographics for `serial` (empty string = the default entry).
+pub fn write_profile_for(db: &Path, serial: &str, v: &Value) -> Result<Demographics> {
     let demo = Demographics::from_json(v);
+    let mut profiles = read_profiles(db);
+    profiles.insert(serial.to_string(), demo.to_json());
     std::fs::write(
         profile_path(db),
-        serde_json::to_vec_pretty(&demo.to_json())?,
+        serde_json::to_vec_pretty(&Value::Object(profiles))?,
     )
     .context("writing profile.json")?;
     Ok(demo)
+}
+
+/// Read the default (no-ring) profile.
+pub fn read_profile(db: &Path) -> Demographics {
+    read_profile_for(db, "")
+}
+pub fn write_profile(db: &Path, v: &Value) -> Result<Demographics> {
+    write_profile_for(db, "", v)
 }
 
 pub fn feature_modes_path(db: &Path) -> PathBuf {
@@ -2124,7 +2162,6 @@ pub fn build_summary(
             .unwrap_or_else(|_| db.to_path_buf())
     });
     let db = db_abs.as_path();
-    let demo = read_profile(db);
     // Only open the DB read-write when a decode migration is actually pending.
     // migrate_if_writable otherwise checkpoints the WAL and bumps the DB mtime,
     // which silently invalidates the dashboard's mtime-keyed summary cache and
@@ -2134,6 +2171,9 @@ pub fn build_summary(
     }
     let store = Store::open_read_only(db).context("opening DB")?;
     let serial = resolve_summary_serial(&store, serial)?;
+    // Demographics are per-ring (profile.json is serial-keyed): the CVA model
+    // and the "Your details" dialog must use this ring's person, not a global.
+    let demo = read_profile_for(db, &serial);
     let ring_name = store.ring_name(&serial)?.unwrap_or_else(|| serial.clone());
     let events = store
         .decoded_events_for(&serial)
@@ -3186,6 +3226,58 @@ pub fn build_summary(
 mod tests {
     use super::*;
 
+    /// Fixtures insert events with raw SQL; the ring registry only adopts
+    /// serials on read-write opens, so register the fixture ring explicitly
+    /// (resolve_summary_serial requires it since multi-ring support).
+    fn register_fixture_ring(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO rings (serial, name, added_unix)
+             VALUES ('S1', 'Test ring', 0) ON CONFLICT(serial) DO NOTHING",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn demographics_are_per_ring_with_default_fallback() {
+        // profile.json is a serial-keyed map: each ring gets its own person,
+        // unknown rings fall back to the "" default, and writes never clobber
+        // each other.
+        let dir = std::env::temp_dir().join(format!(
+            "oura-sum-demo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+
+        // legacy flat file migrates to the "" default
+        std::fs::write(
+            profile_path(&db),
+            r#"{"sex":"M","age":41,"height_m":1.8,"weight_kg":80,"ring_size":10}"#,
+        )
+        .unwrap();
+        assert_eq!(read_profile(&db).age, 41.0);
+        assert_eq!(read_profile_for(&db, "S9").age, 41.0); // fallback to default
+
+        // per-ring write is isolated
+        write_profile_for(&db, "S1", &json!({"sex":"F","age":38})).unwrap();
+        assert_eq!(read_profile_for(&db, "S1").age, 38.0);
+        assert_eq!(read_profile_for(&db, "S1").sex, 'F');
+        assert_eq!(read_profile_for(&db, "S2").age, 41.0); // still the default
+        assert_eq!(read_profile(&db).age, 41.0); // default untouched
+
+        // updating the default does not clobber the ring entry
+        write_profile(&db, &json!({"age": 42})).unwrap();
+        assert_eq!(read_profile(&db).age, 42.0);
+        assert_eq!(read_profile_for(&db, "S1").age, 38.0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn battery_headline_prefers_the_newest_dated_reading() {
         // A newer dated reading wins; an older dated one does not.
@@ -3690,6 +3782,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&db).unwrap();
         // Reset decoder_version to 0 to simulate pre-migration database state.
         conn.execute("DELETE FROM store_meta", []).unwrap();
+        register_fixture_ring(&conn);
 
         let cap = 1_789_195_500_i64;
         // Anchor 1: ring_ds=47_893_458, unix_time=1_787_733_221
@@ -3752,7 +3845,7 @@ mod tests {
         }
         drop(conn);
 
-        let summary = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let summary = build_summary(&db, 0.0, None, &NoModelRunner).unwrap();
         let dated = summary["nights"].as_array().unwrap();
         let undated = summary["clock"]["undated_nights"].as_array().unwrap();
         assert_eq!(
@@ -3792,6 +3885,7 @@ mod tests {
             let _ = Store::open(&db).unwrap();
         }
         let conn = rusqlite::Connection::open(&db).unwrap();
+        register_fixture_ring(&conn);
         let jul3 = 1_783_000_000_i64;
         let jul5 = jul3 + 2 * 86_400;
 
@@ -3850,7 +3944,7 @@ mod tests {
         }
         drop(conn);
 
-        let summary = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let summary = build_summary(&db, 0.0, None, &NoModelRunner).unwrap();
         // Elapsed wall time is jul3..jul5 = 2.0 days (NOT 213.2 + 2.0 = 215.2 days!).
         assert_eq!(summary["device"]["days_of_data"], 2.0);
         assert_eq!(summary["device"]["elapsed_days"], 2.0);
@@ -3948,6 +4042,7 @@ mod tests {
         };
 
         let conn = rusqlite::Connection::open(&db).unwrap();
+        register_fixture_ring(&conn);
         conn.execute(
             "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
              VALUES ('S1', 66, 'time_sync', 1000, X'00000000', ?1, ?2)",
@@ -3964,7 +4059,7 @@ mod tests {
         insert_session(&conn, 3, 10_000 + 3 * day_ds, 8 * 36_000, 54, 50);
         drop(conn);
 
-        let sum_before = build_summary(&db, 0.0, &FakeRunner).unwrap();
+        let sum_before = build_summary(&db, 0.0, None, &FakeRunner).unwrap();
         // `nights` in summary JSON is newest-first:
         // index 0 = Night 3 (4th main night, has 3 prior main nights -> physiology component present!)
         // index 1 = Night 2 (3rd main night, has only 2 prior main nights because nap is excluded -> NO physiology component!)
@@ -3995,7 +4090,7 @@ mod tests {
         insert_session(&conn, 4, 10_000 + 4 * day_ds, 8 * 36_000, 99, 8);
         drop(conn);
 
-        let sum_after = build_summary(&db, 0.0, &FakeRunner).unwrap();
+        let sum_after = build_summary(&db, 0.0, None, &FakeRunner).unwrap();
         let nights_after = sum_after["nights"].as_array().unwrap();
         assert_eq!(nights_after.len(), 6);
         // nights_after[1..] correspond to nights_before[0..]
@@ -4103,6 +4198,7 @@ mod tests {
 
         let base_unix = 1_780_000_000i64;
         let conn = rusqlite::Connection::open(&db).unwrap();
+        register_fixture_ring(&conn);
         conn.execute(
             "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
              VALUES ('S1', 66, 'time_sync', 1000, X'00000000', ?1, ?2)",
@@ -4125,7 +4221,7 @@ mod tests {
             Some(292_000),
         )
         .unwrap();
-        let sum = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let sum = build_summary(&db, 0.0, None, &NoModelRunner).unwrap();
         let night = &sum["nights"].as_array().unwrap()[0];
         assert_eq!(night["start_ds"], 16_000);
         assert_eq!(night["end_ds"], 292_000);
@@ -4134,7 +4230,7 @@ mod tests {
         assert_eq!(night["bedtime_manual"], true);
 
         write_bedtime_override(&db, 10_000, Some(base_unix + 30_000), None, None).unwrap();
-        let sum_reset = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let sum_reset = build_summary(&db, 0.0, None, &NoModelRunner).unwrap();
         let night_reset = &sum_reset["nights"].as_array().unwrap()[0];
         assert_eq!(night_reset["start_ds"], 10_000);
         assert_eq!(night_reset["end_ds"], 298_000);

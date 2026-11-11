@@ -243,6 +243,8 @@ def run(db, tz, profile, serial=None):
     b_sed_dev = np.std(sedvals) if len(sedvals) > 1 else 4000.0
 
     prof = json.loads(Path(profile).read_text()) if profile and Path(profile).exists() else {}
+    if not ("age" in prof or "sex" in prof):  # serial-keyed map (dashboard format)
+        prof = prof.get(serial or "") or prof.get("") or {}
     age = float(prof.get("age", 30))
     h = float(prof.get("height_m", 1.78))
     w = float(prof.get("weight_kg", 75))
