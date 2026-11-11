@@ -199,6 +199,9 @@ function assignControl(im) {
 }
 
 // ── attention (flagged) ───────────────────────────────────────────────────────
+// Qualitative markers (urinalysis strip/microscopy) are stored as ordinal
+// numbers; the lab's own word is the display value when present.
+function disp(m) { return m.latest_text ?? m.latest; }
 function renderAttention(markers) {
   const flagged = markers.filter((m) => m.flagged);
   const panel = $("attention-panel");
@@ -210,7 +213,7 @@ function renderAttention(markers) {
     box.append(h("button", { class: "bl-flag", type: "button", onclick: () => openMarker(m) },
       h("div", { class: "bl-flag-head" },
         h("div", { class: "bl-flag-name" }, m.name),
-        h("div", { class: "bl-flag-val" }, m.latest, h("span", { class: "u" }, m.unit))),
+        h("div", { class: "bl-flag-val" }, disp(m), h("span", { class: "u" }, m.unit))),
       h("div", { class: "bl-flag-note" }, m.advice || `${m.status === "high" ? "Above" : "Below"} the reference range (${m.ref_text} ${m.unit}).`)));
   }
 }
@@ -248,7 +251,7 @@ function markerCard(m) {
       h("div", { class: "bl-card-name" }, m.name),
       statusPill(m)),
     h("div", { class: "bl-card-val" },
-      h("b", null, m.latest), h("span", { class: "u" }, m.unit), deltaChip(m)),
+      h("b", null, disp(m)), h("span", { class: "u" }, m.unit), deltaChip(m)),
     sparkCard(m),
     h("div", { class: "bl-card-foot" },
       h("span", { class: "bl-ref" }, `ref ${m.ref_text}`),
@@ -272,7 +275,7 @@ function openMarker(m) {
   const watch = m.severity === "watch";
   $("dd-name").textContent = m.name;
   clear($("dd-sub")).append(
-    h("b", { style: "color:var(--text);font-weight:600" }, `${m.latest} ${m.unit}`),
+    h("b", { style: "color:var(--text);font-weight:600" }, `${disp(m)} ${m.unit}`),
     `  ·  ref ${m.ref_text}  ·  `, statusPill(m));
 
   const body = clear($("dd-body"));
@@ -282,7 +285,7 @@ function openMarker(m) {
 
   // stat chips
   const stats = h("div", { class: "bl-dd-stats" },
-    statChip("latest", `${m.latest} ${m.unit}`),
+    statChip("latest", `${disp(m)} ${m.unit}`),
     m.delta != null ? statChip("since last", `${signed(m.delta)} (${signed(m.delta_pct)}%)`) : null,
     statChip("reference", `${m.ref_text} ${m.unit}`));
   body.append(stats);
@@ -296,7 +299,7 @@ function openMarker(m) {
       : pill(oob === "high" ? "high" : "low", "ok");
     table.append(h("div", { class: "bl-vrow" },
       h("span", { class: "bl-vdate" }, fmtDate(p.date)),
-      h("span", { class: "bl-vval" }, `${p.value} ${m.unit}`),
+      h("span", { class: "bl-vval" }, `${p.value_text ?? p.value} ${m.unit}`),
       h("span", { class: "bl-vtag" }, tag)));
   });
   body.append(table);
