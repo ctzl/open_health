@@ -46,6 +46,13 @@ struct MarkerDef {
     about: &'static str,
     advice: Option<&'static str>,
     aliases: &'static [&'static str],
+    /// Ordered qualitative scale (index = severity). Rows for this def store
+    /// the ordinal in `value` and the raw wording in `value_text`.
+    scale: Option<&'static [&'static str]>,
+    /// Token that must appear in the row's cells (current or next line) for
+    /// this def to match — disambiguates same-name rows like "Neutrophils %"
+    /// vs "Neutrophils (Absolute) x10E3/uL".
+    unit_hint: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +60,8 @@ struct ParsedMarker {
     key: String,
     raw_name: String,
     value: f64,
+    /// Raw wording for qualitative rows ("Trace", "0-5", ">10"); None for plain numbers.
+    value_text: Option<String>,
     unit: String,
     low: Option<f64>,
     high: Option<f64>,
@@ -93,6 +102,7 @@ struct MarkerRow {
     key: String,
     raw_name: String,
     value: f64,
+    value_text: Option<String>,
     unit: String,
     low: Option<f64>,
     high: Option<f64>,
@@ -101,7 +111,11 @@ struct MarkerRow {
 }
 
 /// Panels in display order.
-const PANELS: [&str; 8] = [
+/// Ordinal scales for qualitative urinalysis rows (index = severity).
+const DIP_SCALE: &[&str] = &["negative", "trace", "small", "moderate", "large"];
+const MICRO_SCALE: &[&str] = &["none", "seen", "few", "moderate", "many"];
+
+const PANELS: [&str; 9] = [
     "Lipids & cardiovascular",
     "Metabolic",
     "Kidney",
@@ -110,6 +124,7 @@ const PANELS: [&str; 8] = [
     "Vitamins & minerals",
     "Hormones",
     "Inflammation",
+    "Urinalysis",
 ];
 
 const MIN_EXPECTED_MARKERS: usize = 4;
@@ -185,6 +200,7 @@ fn init_db(conn: &Connection) -> Result<()> {
             ref_low REAL,
             ref_high REAL,
             ref_text TEXT,
+            value_text TEXT,
             UNIQUE(import_sha, key)
         );
         "#,
@@ -195,6 +211,13 @@ fn init_db(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_serial {
         conn.execute("ALTER TABLE imports ADD COLUMN serial TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    // Qualitative rows (urinalysis): existing DBs get the raw-wording column.
+    let has_value_text: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('marker_rows') WHERE name = 'value_text'")?
+        .exists([])?;
+    if !has_value_text {
+        conn.execute("ALTER TABLE marker_rows ADD COLUMN value_text TEXT", [])?;
     }
     Ok(())
 }
@@ -260,6 +283,11 @@ fn marker_defs() -> Vec<MarkerDef> {
           "The most liver-specific of the routine enzymes.", None, &["alanina-aminotransferase", "alanina aminotransferase", "alt/gpt", "alt", "sgpt", "(alt)"]),
         md("ggt", "GGT", "UI/L", PANELS[3], None, n(73.0), Some("< 73"), Down,
           "Sensitive to alcohol and bile flow.", None, &["gamaglutamil transferase", "ggt"]),
+        // Must precede `ck`: same name tokens, distinguished only by the
+        // ng/mL unit hint (CK-MB mass vs total CK activity in U/L).
+        hint(md("ck_mb", "CK-MB", "ng/mL", PANELS[3], None, n(5.3), Some("< 5.3"), Down,
+          "CK isoenzyme mass; cardiac/muscle injury marker, not the same test as total CK.", None,
+          &["creatine kinase mb", "ck mb", "kinase mb", "creatine kinase"]), "ng ml"),
         md("ck", "Creatine kinase", "U/L", PANELS[3], None, n(439.0), Some("< 439"), Mid,
           "Muscle enzyme; rises after hard or unfamiliar training and muscle injury.",
           Some("A high reading right after heavy training is expected; retest after a few easy days before reading anything clinical."),
@@ -268,6 +296,39 @@ fn marker_defs() -> Vec<MarkerDef> {
           "Heme breakdown product processed by the liver.", None, &["bilirrubina total", "bilirubin total", "bilirubin"]),
         md("albumin", "Albumin", "g/dL", PANELS[3], n(3.2), n(4.8), None, Up,
           "The main blood protein; a marker of liver synthesis and nutrition.", None, &["albumina", "albuminemia", "albumin"]),
+        md("protein_total", "Total protein", "g/dL", PANELS[3], n(6.0), n(8.5), None, Mid,
+          "Albumin plus globulins; liver, immune and nutritional status.", None,
+          &["protein total", "total protein", "protein"]),
+        md("globulin", "Globulin, total", "g/dL", PANELS[3], n(1.5), n(4.5), None, Mid,
+          "Immune proteins and enzymes; the total-protein-minus-albumin fraction.", None,
+          &["globulin total", "globulins", "globulin", "globulina"]),
+        md("ag_ratio", "A/G ratio", "", PANELS[3], n(1.2), n(2.2), None, Mid,
+          "Albumin-to-globulin ratio; coarse liver/immune balance signal.", None,
+          &["a g ratio", "ag ratio", "albumin globulin ratio"]),
+        md("alp", "Alkaline phosphatase", "IU/L", PANELS[3], n(40.0), n(130.0), None, Down,
+          "Bile-duct and bone enzyme; GGT helps separate liver from bone causes.", None,
+          &["alkaline phosphatase", "alkaline", "alp", "fosfatase alcalina"]),
+        md("bun_cr_ratio", "BUN/creatinine ratio", "", PANELS[2], n(9.0), n(23.0), None, Mid,
+          "Hydration and kidney perfusion, read alongside BUN and creatinine.", None,
+          &["bun creatinine ratio", "bun creatinine"]),
+        md("sodium", "Sodium", "mmol/L", PANELS[2], n(134.0), n(144.0), None, Mid,
+          "Main extracellular electrolyte; hydration and adrenal context.", None,
+          &["sodium", "sodio"]),
+        md("potassium", "Potassium", "mmol/L", PANELS[2], n(3.5), n(5.2), None, Mid,
+          "Intracellular electrolyte; muscle and heart rhythm.", None,
+          &["potassium", "potasio"]),
+        md("chloride", "Chloride", "mmol/L", PANELS[2], n(96.0), n(106.0), None, Mid,
+          "Acid-base companion electrolyte.", None,
+          &["chloride", "cloruro"]),
+        md("co2_total", "Carbon dioxide, total", "mmol/L", PANELS[2], n(20.0), n(29.0), None, Mid,
+          "Bicarbonate buffer; acid-base balance.", None,
+          &["carbon dioxide total", "carbon dioxide", "bicarbonate", "co2"]),
+        md("vldl", "VLDL cholesterol", "mg/dL", PANELS[0], n(2.0), n(30.0), None, Down,
+          "Triglyceride-carrying lipoprotein; usually calculated from triglycerides.", None,
+          &["vldl", "vldl cholesterol"]),
+        md("esr", "Sedimentation rate (ESR)", "mm/hr", PANELS[7], n(0.0), n(15.0), None, Down,
+          "Non-specific inflammation; rises slowly and falls slowly.", None,
+          &["sedimentation rate", "erythrocyte sedimentation", "erythrocyte", "sed rate", "esr", "ves"]),
         md("hemoglobin", "Hemoglobin", "g/dL", PANELS[4], n(13.7), n(17.2), None, Mid,
           "Oxygen-carrying protein in red cells.", None, &["hemoglobina", "hemoglobin"]),
         md("hematocrit", "Hematocrit", "%", PANELS[4], n(40.0), n(50.0), None, Mid,
@@ -281,12 +342,71 @@ fn marker_defs() -> Vec<MarkerDef> {
           "Clotting cells.", None, &["plaquetas", "platelets"]),
         md("rdw", "RDW", "%", PANELS[4], n(11.6), n(14.1), None, Down,
           "Variation in red-cell size; an early flag for some anaemias.", None, &["rdw"]),
+        // Differential counts. Percent and absolute rows share a display name
+        // in US reports; unit hints keep them apart ("%" vs "x10E3/uL").
+        hint(md("neut_pct", "Neutrophils %", "%", PANELS[4], n(40.0), n(70.0), None, Mid,
+          "Most abundant white cells; first responders to bacterial infection.", None,
+          &["neutrophils", "neut"]), "%"),
+        hint(md("neut_abs", "Neutrophils (absolute)", "x10^9/L", PANELS[4], n(1.4), n(7.0), None, Mid,
+          "Absolute neutrophil count — the clinically meaningful one.", None,
+          &["neutrophils", "neut"]), "10e"),
+        hint(md("lymph_pct", "Lymphocytes %", "%", PANELS[4], n(20.0), n(40.0), None, Mid,
+          "Viral defence and adaptive immunity.", None,
+          &["lymphs", "lymphocytes", "lymph"]), "%"),
+        hint(md("lymph_abs", "Lymphocytes (absolute)", "x10^9/L", PANELS[4], n(0.7), n(3.1), None, Mid,
+          "Absolute lymphocyte count.", None,
+          &["lymphs", "lymphocytes", "lymph"]), "10e"),
+        hint(md("mono_pct", "Monocytes %", "%", PANELS[4], n(2.0), n(8.0), None, Mid,
+          "Precursors of macrophages; cleanup and chronic inflammation.", None,
+          &["monocytes", "mono"]), "%"),
+        hint(md("mono_abs", "Monocytes (absolute)", "x10^9/L", PANELS[4], n(0.1), n(0.9), None, Mid,
+          "Absolute monocyte count.", None,
+          &["monocytes", "mono"]), "10e"),
+        hint(md("eos_pct", "Eosinophils %", "%", PANELS[4], n(1.0), n(6.0), None, Mid,
+          "Allergy and parasite-associated white cells.", None,
+          &["eos", "eosinophils"]), "%"),
+        hint(md("eos_abs", "Eosinophils (absolute)", "x10^9/L", PANELS[4], n(0.0), n(0.4), None, Mid,
+          "Absolute eosinophil count.", None,
+          &["eos", "eosinophils"]), "10e"),
+        hint(md("baso_pct", "Basophils %", "%", PANELS[4], n(0.0), n(2.0), None, Mid,
+          "Rarest white cells; histamine-related.", None,
+          &["basos", "baso", "basophils"]), "%"),
+        hint(md("baso_abs", "Basophils (absolute)", "x10^9/L", PANELS[4], n(0.0), n(0.2), None, Mid,
+          "Absolute basophil count.", None,
+          &["basos", "baso", "basophils"]), "10e"),
+        hint(md("ig_pct", "Immature granulocytes %", "%", PANELS[4], n(0.0), n(1.0), None, Mid,
+          "Young neutrophil precursors; rises with acute infection.", None,
+          &["immature granulocytes", "immature grans", "immature"]), "%"),
+        hint(md("ig_abs", "Immature granulocytes (absolute)", "x10^9/L", PANELS[4], n(0.0), n(0.1), None, Mid,
+          "Absolute immature granulocyte count.", None,
+          &["immature granulocytes", "immature grans", "immature"]), "10e"),
+        md("mcv", "MCV", "fL", PANELS[4], n(79.0), n(97.0), None, Mid,
+          "Average red-cell size; the classic anaemia classification axis.", None,
+          &["mcv", "mean corpuscular volume"]),
+        md("mch", "MCH", "pg", PANELS[4], n(26.6), n(33.0), None, Mid,
+          "Haemoglobin carried per red cell.", None,
+          &["mch"]),
+        md("mchc", "MCHC", "g/dL", PANELS[4], n(31.5), n(35.7), None, Mid,
+          "Haemoglobin concentration per red cell.", None,
+          &["mchc", "mean corpuscular hemoglobin concentration"]),
         md("vit_d", "Vitamin D (25-OH)", "ng/mL", PANELS[5], n(30.0), n(100.0), None, Up,
           "Vitamin/hormone for bone, immune and muscle function.",
           Some("Track this through winter; the useful target band is usually interpreted against season, sun exposure, and supplementation."),
           &["vitamina d", "vitamin d"]),
         md("ferritin", "Ferritin", "µg/L", PANELS[5], n(39.3), n(439.4), None, Mid,
           "Iron stores.", None, &["ferritina", "ferritin"]),
+        md("iron", "Serum iron", "µg/dL", PANELS[5], n(38.0), n(169.0), None, Mid,
+          "Circulating iron bound to transferrin; varies with time of day.", None,
+          &["serum iron", "iron"]),
+        md("tibc", "TIBC", "µg/dL", PANELS[5], n(250.0), n(450.0), None, Mid,
+          "Total iron-binding capacity; a proxy for transferrin.", None,
+          &["iron bind cap tibc", "tibc", "total iron binding capacity", "iron binding capacity"]),
+        md("uibc", "UIBC", "µg/dL", PANELS[5], n(111.0), n(343.0), None, Mid,
+          "Unsaturated binding capacity; the unused transferrin fraction.", None,
+          &["uibc", "unsaturated iron binding capacity"]),
+        md("iron_sat", "Iron saturation (TSAT)", "%", PANELS[5], n(15.0), n(55.0), None, Mid,
+          "Transferrin saturation; the screening partner for iron and ferritin.", None,
+          &["iron saturation", "iron sat", "transferrin saturation", "tsat"]),
         md("b12", "Vitamin B12", "ng/L", PANELS[5], n(211.0), n(911.0), None, Up,
           "Needed for nerves and red-cell formation.", None, &["vitamina b12", "vitamin b12", "b12"]),
         md("folate", "Folate", "ng/mL", PANELS[5], n(5.4), None, Some("> 5.4"), Up,
@@ -298,7 +418,8 @@ fn marker_defs() -> Vec<MarkerDef> {
         md("tsh", "TSH", "mUI/L", PANELS[6], n(0.55), n(4.78), None, Mid,
           "Pituitary signal that sets thyroid output.", None, &["hormona tirostimulante", "tsh"]),
         md("ft4", "Free T4", "pmol/L", PANELS[6], n(10.3), n(34.7), None, Mid,
-          "The circulating thyroid hormone reserve.", None, &["tiroxina livre", "free t4", "ft4"]),
+          "The circulating thyroid hormone reserve.", None,
+          &["tiroxina livre", "free t4", "ft4", "t4 free", "t4"]),
         md("ft3", "Free T3", "pmol/L", PANELS[6], n(3.5), n(6.5), None, Mid,
           "The active thyroid hormone.", None, &["triiodotironina livre", "free t3", "ft3"]),
         md("test_free", "Testosterone, free", "pg/mL", PANELS[6], n(12.30), n(46.60), None, Up,
@@ -314,6 +435,67 @@ fn marker_defs() -> Vec<MarkerDef> {
           "High-sensitivity marker of systemic inflammation and vascular risk.",
           Some("Very low readings are a good sign for cardiovascular risk; interpret spikes against infections or hard training."),
           &["proteina c reactiva ultra-sensivel", "proteina c reativa ultra-sensivel", "pcr ultra", "c reactive protein", "hs crp", "crp"]),
+        // ── Urinalysis ───────────────────────────────────────────────────────
+        // Dipstick rows are ordinal words (Negative/Trace/…); microscopy rows
+        // mix words ("None seen") with ranges ("0-5 /hpf"). Both store the
+        // raw wording in value_text; `value` is the scale ordinal or, for a
+        // range, its upper bound.
+        md("urine_sg", "Specific gravity", "", PANELS[8], n(1.005), n(1.030), None, Mid,
+          "Urine concentration; hydration and kidney concentrating ability.", None,
+          &["specific gravity"]),
+        md("urine_ph", "Urine pH", "", PANELS[8], n(5.0), n(7.5), None, Mid,
+          "Acid-base balance of urine; diet and stone risk.", None,
+          &["ph", "ur ph"]),
+        mdq("urine_color", "Urine colour", "", PANELS[8],
+          &["yellow", "straw", "clear", "cloudy", "turbid", "brown", "red"], Some("Yellow"),
+          "Visual appearance; hydration and sometimes diet or drugs.",
+          &["urine color"]),
+        mdq("urine_appearance", "Appearance", "", PANELS[8],
+          &["clear", "cloudy", "turbid"], Some("Clear"),
+          "Turbidity can indicate cells, crystals, or contamination.",
+          &["appearance"]),
+        mdq("urine_leuk", "WBC esterase", "", PANELS[8],
+          &["negative", "trace", "small", "moderate", "large"], Some("Negative"),
+          "White cells in urine — a screen for urinary tract inflammation.",
+          &["wbc esterase", "leukocyte esterase", "leukocytes"]),
+        mdq("urine_protein", "Protein", "", PANELS[8], DIP_SCALE, Some("Negative/Trace"),
+          "Protein leakage; kidney screening and hydration context.",
+          &["protein"]),
+        mdq("urine_glucose", "Glucose", "", PANELS[8], DIP_SCALE, Some("Negative"),
+          "Sugar in urine; usually only appears above the renal threshold.",
+          &["glucose"]),
+        mdq("urine_ketones", "Ketones", "", PANELS[8], DIP_SCALE, Some("Negative"),
+          "Fat-breakdown products; fasting, low-carb intake, or ketosis.",
+          &["ketones", "ketone"]),
+        mdq("urine_blood", "Occult blood", "", PANELS[8], DIP_SCALE, Some("Negative"),
+          "Trace haemoglobin in urine; stones, exercise, or irritation.",
+          &["occult blood", "blood"]),
+        mdq("urine_bilirubin", "Bilirubin", "", PANELS[8], DIP_SCALE, Some("Negative"),
+          "Bile pigment in urine; pairs with liver panels.",
+          &["bilirubin"]),
+        md("urine_urobilinogen", "Urobilinogen", "mg/dL", PANELS[8], n(0.2), n(1.0), None, Mid,
+          "Bilirubin breakdown product; normal gut-flora metabolism.", None,
+          &["urobilinogen"]),
+        mdq("urine_nitrite", "Nitrite", "", PANELS[8],
+          &["negative", "positive"], Some("Negative"),
+          "Bacterial conversion of nitrate; a UTI screen.",
+          &["nitrite"]),
+        mdq("urine_wbc", "WBC (microscopy)", "/hpf", PANELS[8], MICRO_SCALE, Some("0 - 5 /hpf"),
+          "White cells counted under the microscope.",
+          &["wbc"]),
+        mdq("urine_rbc", "RBC (microscopy)", "/hpf", PANELS[8], MICRO_SCALE, Some("0 - 2 /hpf"),
+          "Red cells counted under the microscope.",
+          &["rbc"]),
+        mdq("urine_epi", "Epithelial cells", "/hpf", PANELS[8], MICRO_SCALE, Some("0 - 10 /hpf"),
+          "Skin/tract cells; high counts usually mean sample contamination.",
+          &["epithelial cells", "epithelial"]),
+        mdq("urine_casts", "Casts", "/lpf", PANELS[8], MICRO_SCALE, Some("None seen /lpf"),
+          "Protein moulds from the kidney tubules.",
+          &["casts", "hyaline casts"]),
+        mdq("urine_bacteria", "Bacteria", "/hpf", PANELS[8],
+          &["none", "few", "moderate", "many"], Some("None"),
+          "Bacteria seen on microscopy; interpret with nitrite/esterase.",
+          &["bacteria"]),
     ]
 }
 
@@ -343,7 +525,41 @@ fn md(
         about,
         advice,
         aliases,
+        scale: None,
+        unit_hint: None,
     }
+}
+/// Qualitative marker: the value cell is an ordinal word from `scale`.
+fn mdq(
+    key: &'static str,
+    name: &'static str,
+    unit: &'static str,
+    panel: &'static str,
+    scale: &'static [&'static str],
+    ref_text: Option<&'static str>,
+    about: &'static str,
+    aliases: &'static [&'static str],
+) -> MarkerDef {
+    MarkerDef {
+        key,
+        name,
+        unit,
+        panel,
+        low: None,
+        high: None,
+        ref_text,
+        good: Dir::Mid,
+        about,
+        advice: None,
+        aliases,
+        scale: Some(scale),
+        unit_hint: None,
+    }
+}
+/// Attach a unit hint to a def (see MarkerDef::unit_hint).
+fn hint(mut d: MarkerDef, h: &'static str) -> MarkerDef {
+    d.unit_hint = Some(h);
+    d
 }
 
 /// Resolve the pdftotext binary once per process. Plain PATH lookup first;
@@ -414,8 +630,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn extract_pdf_text(path: &Path) -> Result<String> {
+    run_pdftotext(path, "-layout")
+}
+
+fn extract_pdf_text_raw(path: &Path) -> Result<String> {
+    run_pdftotext(path, "-raw")
+}
+
+fn run_pdftotext(path: &Path, mode: &str) -> Result<String> {
     let out = Command::new(pdftotext_bin())
-        .arg("-layout")
+        .arg(mode)
         .arg(path)
         .arg("-")
         .output()
@@ -449,6 +673,15 @@ fn parse_pdf(path: &Path) -> Result<ParsedReport> {
         warnings.push("collection date not found".to_string());
     }
     let mut markers = parse_markers(&text, &mut warnings);
+    // The -layout column grid drifts inside the urinalysis microscopy block
+    // when values wrap ("None seen" split across lines), assigning values to
+    // the wrong marker. Re-parse that block from the -raw reading order.
+    if let Ok(raw) = extract_pdf_text_raw(path) {
+        for m in parse_urine_micro_raw(&raw) {
+            markers.retain(|x| x.key != m.key);
+            markers.push(m);
+        }
+    }
     if markers.len() < MIN_EXPECTED_MARKERS {
         merge_fallback_markers(&mut markers, llm_fallback_markers(&text, &mut warnings));
     }
@@ -511,55 +744,279 @@ fn date_from_filename(name: &str) -> Option<String> {
 
 fn parse_markers(text: &str, warnings: &mut Vec<String>) -> Vec<ParsedMarker> {
     let defs = marker_defs();
+    let lines: Vec<&str> = text.lines().collect();
     let mut out: BTreeMap<String, ParsedMarker> = BTreeMap::new();
-    for line in text.lines() {
-        let Some((raw_name, cells)) = split_result_line(line) else {
+    // Which report section the current line belongs to. Urinalysis reuses
+    // names from other panels (WBC, RBC, glucose, bilirubin, protein); the
+    // section decides which def gets first refusal on a row.
+    let mut section: &str = "";
+    for i in 0..lines.len() {
+        let raw_line = lines[i].trim();
+        let nl = normalize(raw_line);
+        if nl.starts_with("urinalysis") || nl.starts_with("microscopic") {
+            section = PANELS[8];
+            continue;
+        }
+        if nl.starts_with("cbc with") {
+            section = PANELS[4];
+            continue;
+        }
+        let Some((raw_name, mut cells)) = split_result_line(raw_line) else {
             continue;
         };
-        let norm = normalize(&raw_name);
-        if norm.contains("bun creatinine") {
-            continue; // derived ratio, not a tracked marker
-        }
-        if cells.first().is_some_and(|c| is_qualitative(&normalize(c))) {
-            continue; // urinalysis-style qualitative rows
-        }
-        let Some(def) = match_def(&raw_name, &defs) else {
-            continue;
-        };
-        if out.contains_key(def.key) {
-            continue;
-        }
-        if def.key == "hemoglobin" && norm.contains("a1c") {
-            continue;
-        }
-        // Only warn for rows that look like data: the value cell must start
-        // with a digit or a < > = prefix. Section headers ("Vitamin D,
-        // 25-Hydroxy  <footnote prose>"), stray "." lines, and qualitative
-        // urinalysis rows are skipped silently.
-        let looks_numeric = cells.first().is_some_and(|c| {
-            let t = c.trim();
-            t.starts_with(['<', '>', '=']) || t.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        });
-        match parse_cells(&cells, *def) {
-            Some(parsed) => {
-                out.insert(
-                    def.key.to_string(),
-                    ParsedMarker {
-                        key: def.key.to_string(),
-                        raw_name,
-                        value: parsed.value,
-                        unit: parsed.unit,
-                        low: parsed.low,
-                        high: parsed.high,
-                        ref_text: parsed.ref_text,
-                    },
-                );
+        // US reports wrap the unit onto its own line ("Vitamin B12 1119
+        // 232-1245" + "pg/mL"). Fold a standalone unit line into this row.
+        if let Some(nx) = lines.get(i + 1).map(|l| l.trim()) {
+            if !nx.is_empty()
+                && !nx.contains(char::is_whitespace)
+                && (nx.contains('/') || nx.contains('^'))
+                && !nx.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && unit_token(nx).is_some()
+            {
+                cells.push(nx.to_string());
             }
-            None if looks_numeric => warnings.push(format!("could not parse row: {raw_name}")),
-            None => {}
         }
+        let norm = normalize(&raw_name);
+        let tokens: Vec<&str> = norm.split_whitespace().collect();
+        // Candidate defs: alias match (longest alias wins, so "Neutrophils
+        // (Absolute)" beats the plain "%"), plus a unit hint that appears in
+        // the row's text (current line plus the next, for wrapped units like
+        // "(Absolute) x10E3/uL"). Urinalysis defs only match inside the
+        // urinalysis section — that is what separates its glucose/bilirubin/
+        // WBC rows from the same names on other panels.
+        let hay_raw = format!(
+            "{} {}",
+            raw_line,
+            lines.get(i + 1).copied().unwrap_or("")
+        );
+        let hay = normalize(&hay_raw);
+        let mut cands: Vec<(&MarkerDef, usize)> = defs
+            .iter()
+            .filter_map(|d| {
+                if d.panel == PANELS[8] && section != PANELS[8] {
+                    return None;
+                }
+                if let Some(h) = d.unit_hint {
+                    // "%" only survives in the raw text; "10e" only in the
+                    // lowercased form. Check both.
+                    if !hay_raw.contains(h) && !hay.contains(h) {
+                        return None;
+                    }
+                }
+                let best = d
+                    .aliases
+                    .iter()
+                    .filter(|a| token_seq(&tokens, a))
+                    .map(|a| a.split_whitespace().count())
+                    .max()?;
+                Some((d, best))
+            })
+            .collect();
+        cands.sort_by_key(|(d, len)| (if d.panel == section { 0 } else { 1 }, std::cmp::Reverse(*len)));
+        let had_candidates = !cands.is_empty();
+        let mut parsed: Option<(&MarkerDef, ParsedMarker)> = None;
+        for (def, _) in cands {
+            if out.contains_key(def.key) {
+                continue; // this report already has a row for that marker
+            }
+            // Guard against name collisions between panels: "hemoglobin A1c"
+            // must not land in the CBC haemoglobin series.
+            if def.key == "hemoglobin" && norm.contains("a1c") {
+                continue;
+            }
+            let pc = match def.scale {
+                Some(scale) => match parse_scale_cells(def, scale, &cells) {
+                    Some(x) => x,
+                    None => continue,
+                },
+                None => match parse_cells(&cells, *def) {
+                    Some(x) => x,
+                    None => continue,
+                },
+            };
+            parsed = Some((
+                def,
+                ParsedMarker {
+                    key: def.key.to_string(),
+                    raw_name: raw_name.clone(),
+                    value: pc.value,
+                    value_text: pc.value_text,
+                    unit: pc.unit,
+                    low: pc.low,
+                    high: pc.high,
+                    ref_text: pc.ref_text,
+                },
+            ));
+            break;
+        }
+        let Some((_, row)) = parsed else {
+            // Only warn for rows that look like data: the value cell must
+            // start with a digit or a < > = prefix. Section headers ("Vitamin
+            // D, 25-Hydroxy  <footnote prose>"), stray "." lines, and
+            // qualitative rows with no catalogued def are skipped silently.
+            let looks_numeric = cells.first().is_some_and(|c| {
+                let t = c.trim();
+                t.starts_with(['<', '>', '='])
+                    || t.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            });
+            if looks_numeric && had_candidates && !raw_name.contains(':') {
+                // Names containing ':' are footnote legends (": : : If LDL-C
+                // 160-189 : :"), not result rows; don't warn about those.
+                warnings.push(format!("could not parse row: {raw_name}"));
+            }
+            continue;
+        };
+        out.insert(row.key.clone(), row);
     }
     out.into_values().collect()
+}
+
+/// Re-parse the urinalysis microscopy block from pdftotext -raw output.
+/// In -layout mode, wrapped values ("None" / "seen" on separate lines) shift
+/// the value column off the name column, so counts land on the wrong marker.
+/// The raw stream keeps reading order: name lines, then value tokens, then
+/// reference text, per row. Only urinalysis defs may match in this block.
+fn parse_urine_micro_raw(raw: &str) -> Vec<ParsedMarker> {
+    let defs = marker_defs();
+    let Some(start) = raw.lines().position(|l| l.trim().starts_with("Urinalysis Reflex")) else {
+        return Vec::new();
+    };
+    // Glue split numeric ranges ("0 - 5") into one token before classifying.
+    let range_dash = Regex::new(r"(\d)\s+-\s+(\d)").unwrap();
+    let mut out: BTreeMap<String, ParsedMarker> = BTreeMap::new();
+    let mut name = String::new();
+    let mut cells: Vec<String> = Vec::new();
+    let flush = |name: &mut String, cells: &mut Vec<String>, out: &mut BTreeMap<String, ParsedMarker>| {
+        if !name.is_empty() && !cells.is_empty() {
+            if let Some(def) = match_def_in(name, &defs, PANELS[8]) {
+                if let Some(pc) = def.scale.and_then(|s| parse_scale_cells(def, s, cells)) {
+                    out.insert(
+                        def.key.to_string(),
+                        ParsedMarker {
+                            key: def.key.to_string(),
+                            raw_name: std::mem::take(name),
+                            value: pc.value,
+                            value_text: pc.value_text,
+                            unit: pc.unit,
+                            low: pc.low,
+                            high: pc.high,
+                            ref_text: pc.ref_text,
+                        },
+                    );
+                }
+            }
+        }
+        name.clear();
+        cells.clear();
+    };
+    for line in raw.lines().skip(start + 1) {
+        let t = line.trim();
+        if t.is_empty()
+            || t.starts_with("This specimen")
+            || t.starts_with("Component")
+            || t.starts_with("Comment")
+        {
+            continue;
+        }
+        if t.starts_with("CBC with Differential") || t.starts_with("Urinalysis") {
+            break;
+        }
+        let t = range_dash.replace_all(t, "$1-$2");
+        for tok in t.split_whitespace() {
+            let is_ref = tok.contains('/') && !tok.bytes().next().is_some_and(|c| c.is_ascii_digit());
+            let is_val = !is_ref
+                && (tok.bytes().next().is_some_and(|c| c.is_ascii_digit())
+                    || tok.starts_with(['>', '<', '='])
+                    || MICRO_SCALE.iter().any(|w| normalize(tok) == *w));
+            if is_ref || is_val {
+                cells.push(tok.to_string());
+            } else if cells.is_empty() {
+                // Name continuation ("Epithelial Cells (non" + "renal)").
+                if !name.is_empty() {
+                    name.push(' ');
+                }
+                name.push_str(tok);
+            } else {
+                flush(&mut name, &mut cells, &mut out);
+                name.push_str(tok);
+            }
+        }
+    }
+    flush(&mut name, &mut cells, &mut out);
+    out.into_values().collect()
+}
+
+/// Index of a scale word in a value cell, allowing trailing qualifiers
+/// ("None seen" -> "none", "Negative for blood" -> "negative").
+fn scale_value(cell: &str, scale: &[&str]) -> Option<f64> {
+    let n = normalize(cell);
+    scale
+        .iter()
+        .position(|w| n == *w || (n.starts_with(w) && n.as_bytes().get(w.len()) == Some(&b' ')))
+        .map(|i| i as f64)
+}
+
+/// Numeric value of a microscopy cell: plain number, ">10", or a range
+/// "0-5" (encoded as its upper bound).
+fn numericish_value(cell: &str) -> Option<f64> {
+    let t = cell.trim();
+    let range = Regex::new(r"^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$").ok()?;
+    if let Some(c) = range.captures(t) {
+        return c[2].parse().ok();
+    }
+    if t.starts_with(['>', '<', '=']) || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return parse_value_unit(t).map(|(v, _, _)| v);
+    }
+    None
+}
+
+/// Parse a row for a def with a qualitative scale. The raw wording is kept
+/// in value_text; `value` is the scale ordinal, or a range's upper bound.
+fn parse_scale_cells(def: &MarkerDef, scale: &[&str], cells: &[String]) -> Option<ParsedCells> {
+    let first = cells.first()?.trim();
+    let value = match scale_value(first, scale) {
+        Some(v) => v,
+        None => numericish_value(first)?,
+    };
+    let mut low = None;
+    let mut high = None;
+    let mut ref_text = None;
+    for c in cells.iter().skip(1) {
+        if let Some((l, h, t)) = parse_ref(c) {
+            low = l;
+            high = h;
+            ref_text = Some(t);
+            break;
+        }
+    }
+    let unit = cells
+        .iter()
+        .find_map(|c| unit_token(c))
+        .unwrap_or_else(|| def.unit.to_string());
+    // US reports often print the value twice ("Leukocytes Negative Negative")
+    // or run the value into the reference ("Trace Negative/Trace" as one
+    // cell). Strip the reference suffix so value_text shows the result only.
+    let mut value_text = first.to_string();
+    let ref_src = ref_text.clone().or_else(|| def.ref_text.map(str::to_string));
+    if let Some(rt) = &ref_src {
+        if value_text.len() > rt.len() && value_text.ends_with(rt.as_str()) {
+            value_text.truncate(value_text.len() - rt.len());
+            value_text = value_text.trim_end().to_string();
+        }
+    }
+    // collapse exact duplicate halves ("Negative Negative" -> "Negative")
+    let words: Vec<&str> = value_text.split_whitespace().collect();
+    if words.len() >= 2 && words.len() % 2 == 0 && words[..words.len() / 2] == words[words.len() / 2..] {
+        value_text = words[..words.len() / 2].join(" ");
+    }
+    Some(ParsedCells {
+        value,
+        value_text: Some(value_text),
+        unit,
+        low,
+        high,
+        ref_text,
+    })
 }
 
 fn merge_fallback_markers(markers: &mut Vec<ParsedMarker>, fallback: Vec<ParsedMarker>) {
@@ -651,6 +1108,7 @@ fn parse_llm_marker_json(text: &str, warnings: &mut Vec<String>) -> Vec<ParsedMa
                 key: key.to_string(),
                 raw_name: r["raw_name"].as_str().unwrap_or(def.name).to_string(),
                 value,
+                value_text: r["value_text"].as_str().map(str::to_string),
                 unit: r["unit"].as_str().unwrap_or(def.unit).to_string(),
                 low: r["ref_low"].as_f64().or(def.low),
                 high: r["ref_high"].as_f64().or(def.high),
@@ -669,11 +1127,31 @@ fn split_result_line(line: &str) -> Option<(String, Vec<String>)> {
         return None;
     }
     let splitter = Regex::new(r"\s{2,}").unwrap();
-    let parts: Vec<String> = splitter
+    let mut parts: Vec<String> = splitter
         .split(line)
         .map(clean_cell)
         .filter(|s| !s.is_empty())
         .collect();
+    if parts.len() < 2 {
+        // Some US rows are single-spaced end to end ("Creatine
+        // Kinase,Total 114 49-439 U/L"). Split at the first numeric token;
+        // the def-match and cell-parse guards reject prose lines.
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let strict_numeric = |t: &str| {
+            !t.is_empty()
+                && t.chars().all(|c| c.is_ascii_digit() || "-.,><=".contains(c))
+                && t.chars().any(|c| c.is_ascii_digit())
+        };
+        if let Some(k) = toks.iter().position(|t| strict_numeric(t)) {
+            // A real result row has a short name and >=2 cells after it;
+            // prose notes ("...less than 20 ng/mL") have long names.
+            if k > 0 && k <= 6 && toks.len() - k >= 2 {
+                parts.clear();
+                parts.push(toks[..k].join(" "));
+                parts.extend(toks[k..].iter().map(|s| s.to_string()));
+            }
+        }
+    }
     if parts.len() < 2 {
         return None;
     }
@@ -722,11 +1200,33 @@ fn looks_like_header(name: &str) -> bool {
         || n.contains("val ref")
 }
 
+/// Alias lookup kept for the alias-normalisation tests; the parser itself
+/// uses the candidate ranking in parse_markers.
+#[cfg(test)]
 fn match_def<'a>(name: &str, defs: &'a [MarkerDef]) -> Option<&'a MarkerDef> {
     let n = normalize(name);
     let tokens: Vec<&str> = n.split_whitespace().collect();
     defs.iter()
         .find(|d| d.aliases.iter().any(|a| token_seq(&tokens, a)))
+}
+
+/// Like match_def, but restricted to one panel and preferring the longest
+/// matching alias (the raw-mode urinalysis block reuses CBC marker names).
+fn match_def_in<'a>(name: &str, defs: &'a [MarkerDef], panel: &str) -> Option<&'a MarkerDef> {
+    let n = normalize(name);
+    let tokens: Vec<&str> = n.split_whitespace().collect();
+    defs.iter()
+        .filter(|d| d.panel == panel)
+        .filter_map(|d| {
+            d.aliases
+                .iter()
+                .filter(|a| token_seq(&tokens, a))
+                .map(|a| a.split_whitespace().count())
+                .max()
+                .map(|len| (d, len))
+        })
+        .max_by_key(|(_, len)| *len)
+        .map(|(d, _)| d)
 }
 
 /// An alias matches only as a contiguous run of whole tokens, so "vldl"
@@ -739,6 +1239,7 @@ fn token_seq(tokens: &[&str], alias: &str) -> bool {
 
 struct ParsedCells {
     value: f64,
+    value_text: Option<String>,
     unit: String,
     low: Option<f64>,
     high: Option<f64>,
@@ -771,8 +1272,14 @@ fn parse_cells(cells: &[String], def: MarkerDef) -> Option<ParsedCells> {
         unit = unit_token(&unit).unwrap_or_default();
     }
     if unit.is_empty() && cells.get(1).is_some_and(|c| !is_ref_cell(c)) {
-        unit = cells[1].trim().to_string();
-        next = 2;
+        // A multi-word cell is prose ("Not Estab. %"), not a unit; only take
+        // a unit-looking token from it.
+        let c = cells[1].trim();
+        let taken = if c.contains(' ') { unit_token(c) } else { Some(c.to_string()) };
+        if let Some(u) = taken {
+            unit = u;
+            next = 2;
+        }
     }
     if low.is_none() && high.is_none() {
         for c in cells.iter().skip(next) {
@@ -798,6 +1305,7 @@ fn parse_cells(cells: &[String], def: MarkerDef) -> Option<ParsedCells> {
     }
     Some(ParsedCells {
         value,
+        value_text: None,
         unit: unit.trim().to_string(),
         low,
         high,
@@ -826,14 +1334,6 @@ fn unit_token(s: &str) -> Option<String> {
     tokens
         .into_iter()
         .find(|t| t == "%" || t.contains('/') || t.ends_with('L'))
-}
-
-fn is_qualitative(n: &str) -> bool {
-    matches!(
-        n,
-        "negative" | "negative trace" | "trace" | "small" | "moderate" | "large" | "normal"
-            | "clear" | "yellow" | "not estab" | "not established"
-    )
 }
 
 fn parse_ref(s: &str) -> Option<(Option<f64>, Option<f64>, String)> {
@@ -913,9 +1413,19 @@ fn store_report(conn: &mut Connection, report: &ParsedReport, serial: &str) -> R
     for m in &report.markers {
         tx.execute(
             "INSERT INTO marker_rows
-             (import_sha, key, raw_name, value, unit, ref_low, ref_high, ref_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![report.sha, m.key, m.raw_name, m.value, m.unit, m.low, m.high, m.ref_text,],
+             (import_sha, key, raw_name, value, value_text, unit, ref_low, ref_high, ref_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                report.sha,
+                m.key,
+                m.raw_name,
+                m.value,
+                m.value_text,
+                m.unit,
+                m.low,
+                m.high,
+                m.ref_text,
+            ],
         )?;
     }
     tx.commit()?;
@@ -952,7 +1462,7 @@ fn read_imports(conn: &Connection, serial: Option<&str>) -> Result<Vec<ImportRow
 
 fn read_marker_rows(conn: &Connection, serial: Option<&str>) -> Result<Vec<MarkerRow>> {
     let mut st = conn.prepare(
-        "SELECT m.import_sha, m.key, m.raw_name, m.value, m.unit, m.ref_low, m.ref_high, m.ref_text, i.collection_date
+        "SELECT m.import_sha, m.key, m.raw_name, m.value, m.value_text, m.unit, m.ref_low, m.ref_high, m.ref_text, i.collection_date
          FROM marker_rows m
          JOIN imports i ON i.sha = m.import_sha
          WHERE (?1 = '' OR i.serial = ?1)
@@ -965,11 +1475,12 @@ fn read_marker_rows(conn: &Connection, serial: Option<&str>) -> Result<Vec<Marke
                 key: r.get(1)?,
                 raw_name: r.get(2)?,
                 value: r.get(3)?,
-                unit: r.get(4)?,
-                low: r.get(5)?,
-                high: r.get(6)?,
-                ref_text: r.get(7)?,
-                date: r.get(8)?,
+                value_text: r.get(4)?,
+                unit: r.get(5)?,
+                low: r.get(6)?,
+                high: r.get(7)?,
+                ref_text: r.get(8)?,
+                date: r.get(9)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1430,8 +1941,10 @@ fn marker_json(def: &MarkerDef, points_in: &[&MarkerRow]) -> Value {
     } else {
         "neutral"
     };
-    let (trend, trend_good, delta, delta_pct) = match prev {
-        Some(p) => {
+    // Ordinal scale values ("Trace" -> 1) carry no meaningful delta.
+    let (trend, trend_good, delta, delta_pct) = match (prev, def.scale) {
+        (_, Some(_)) => ("flat", true, None, None),
+        (Some(p), None) => {
             let d = latest - p;
             let eps = (latest.abs() * 0.005).max(1e-9);
             let dir = if d.abs() <= eps {
@@ -1467,11 +1980,17 @@ fn marker_json(def: &MarkerDef, points_in: &[&MarkerRow]) -> Value {
                 },
             )
         }
-        None => ("flat", true, None, None),
+        (None, None) => ("flat", true, None, None),
     };
     let pts: Vec<Value> = points
         .iter()
-        .map(|r| json!({ "date": r.date, "value": round(r.value, 3) }))
+        .map(|r| {
+            json!({
+                "date": r.date,
+                "value": round(r.value, 3),
+                "value_text": r.value_text,
+            })
+        })
         .collect();
 
     json!({
@@ -1487,6 +2006,7 @@ fn marker_json(def: &MarkerDef, points_in: &[&MarkerRow]) -> Value {
         "ref_text": ref_text(def, Some(latest_row)),
         "points": pts,
         "latest": round(latest, 3),
+        "latest_text": latest_row.value_text,
         "latest_date": latest_row.date,
         "prev": prev.map(|p| round(p, 3)),
         "delta": delta,
@@ -1540,6 +2060,103 @@ Data Colheita                   09-06-2026 09:13
     }
 
     #[test]
+    fn parses_iron_panel_and_ag_ratio() {
+        let text = r#"
+Iron and TIBC
+Iron                  127    38-169 ug/dL
+Iron Bind.Cap.(TIBC) 318     250-450 ug/dL
+Iron Saturation       40     15-55 %
+UIBC                  191    111-343 ug/dL
+A/G Ratio            1.7 1.2-2.2
+"#;
+        let mut warnings = Vec::new();
+        let rows = parse_markers(text, &mut warnings);
+        let by_key: HashMap<_, _> = rows.iter().map(|r| (r.key.as_str(), r.value)).collect();
+        assert_eq!(by_key["iron"], 127.0);
+        assert_eq!(by_key["tibc"], 318.0);
+        assert_eq!(by_key["iron_sat"], 40.0);
+        assert_eq!(by_key["uibc"], 191.0);
+        assert_eq!(by_key["ag_ratio"], 1.7);
+    }
+
+    #[test]
+    fn vitamin_d_rows_parse_not_prose() {
+        // Header-only line and footnote prose must not produce rows;
+        // the single-spaced result row must.
+        let mut warnings = Vec::new();
+        let rows = parse_markers(
+            "\nVitamin D, 25-Hydroxy\nVitamin D, 25-Hydroxy 49.8 30.0-100.0 ng/mL\nlevel of serum 25-OH vitamin D less than 20 ng/mL (1,2).\n",
+            &mut warnings,
+        );
+        assert_eq!(rows.len(), 1, "rows={rows:?} warnings={warnings:?}");
+        assert_eq!(rows[0].key, "vit_d");
+        assert!((rows[0].value - 49.8).abs() < 1e-9);
+        assert!(warnings.is_empty(), "warnings={warnings:?}");
+
+        // Multi-space row with a trailing footnote cell (real report layout).
+        let mut warnings = Vec::new();
+        let rows = parse_markers(
+            "\nVitamin D, 25-Hydroxy 39.3  30.0-100.0 ng/mL  1. IOM (Institute of Medicine). 2010. Dietary\n",
+            &mut warnings,
+        );
+        assert_eq!(rows.len(), 1, "rows={rows:?} warnings={warnings:?}");
+        assert!((rows[0].value - 39.3).abs() < 1e-9);
+        assert!(warnings.is_empty(), "warnings={warnings:?}");
+    }
+
+    #[test]
+    fn ck_mb_mass_is_not_total_ck() {
+        let text = r#"
+Creatine Kinase (CK),  1.1    0.0-5.3 ng/mL
+MB
+Creatine Kinase,Total 114 49-439 U/L
+"#;
+        let mut warnings = Vec::new();
+        let rows = parse_markers(text, &mut warnings);
+        let by_key: HashMap<_, _> = rows.iter().map(|r| (r.key.as_str(), r.value)).collect();
+        assert_eq!(by_key["ck_mb"], 1.1);
+        assert_eq!(by_key["ck"], 114.0);
+    }
+
+    #[test]
+    fn urine_micro_raw_recovers_shifted_block() {
+        // Reading order from pdftotext -raw on a Labcorp report where the
+        // -layout grid mis-assigns values (epi got "seen", casts got "0-10").
+        let raw = r#"
+Urinalysis Reflex Comment
+This specimen will not reflex to a Urine
+Culture.
+WBC
+None
+seen
+0 - 5 /hpf
+RBC
+None
+seen
+0 - 2 /hpf
+Epithelial Cells (non
+renal)
+0-10 0 - 10 /hpf
+Casts
+None
+seen
+None seen /lpf
+Bacteria
+None
+seen
+None seen/Few
+CBC with Differential/Platelet
+"#;
+        let rows = parse_urine_micro_raw(raw);
+        let by_key: HashMap<_, _> = rows.iter().map(|r| (r.key.as_str(), r.value)).collect();
+        assert_eq!(by_key["urine_wbc"], 0.0);
+        assert_eq!(by_key["urine_rbc"], 0.0);
+        assert_eq!(by_key["urine_epi"], 10.0);
+        assert_eq!(by_key["urine_casts"], 0.0);
+        assert_eq!(by_key["urine_bacteria"], 0.0);
+    }
+
+    #[test]
     fn parses_cuf_rows() {
         let text = r#"
 Data de inscrição: 09/09/2025   09:16:41
@@ -1559,6 +2176,101 @@ Data de inscrição: 09/09/2025   09:16:41
         assert_eq!(by_key["ldl"], 166.0);
         assert_eq!(by_key["egfr"], 103.0);
         assert_eq!(by_key["test_total"], 144.7);
+    }
+
+    #[test]
+    fn parses_urinalysis_qualitative_rows() {
+        let text = "\
+Urinalysis
+Protein  Trace  Negative
+Glucose  Negative  Negative
+Ketones  Negative  Negative
+Bilirubin  Negative  Negative
+Blood  Trace  Negative
+Leukocytes  Negative  Negative
+Nitrite  Negative  Negative
+Microscopic
+WBC  0 - 5  /hpf
+RBC  <1  /hpf
+Squamous Epithelial Cells  Few  /hpf
+Bacteria  Few  /hpf";
+        let mut warnings = vec![];
+        let markers = parse_markers(text, &mut warnings);
+        let get = |k: &str| markers.iter().find(|m| m.key == k);
+        assert_eq!(get("urine_protein").unwrap().value, 1.0); // Trace
+        assert_eq!(
+            get("urine_protein").unwrap().value_text.as_deref(),
+            Some("Trace")
+        );
+        assert_eq!(get("urine_blood").unwrap().value, 1.0);
+        assert_eq!(get("urine_leuk").unwrap().value, 0.0); // Negative
+        assert_eq!(get("urine_glucose").unwrap().value, 0.0);
+        assert_eq!(get("urine_bilirubin").unwrap().value, 0.0);
+        // microscopy: range upper bound, "<1" numeric, ordinal words
+        assert_eq!(get("urine_wbc").unwrap().value, 5.0);
+        assert_eq!(get("urine_wbc").unwrap().unit, "/hpf");
+        assert_eq!(get("urine_rbc").unwrap().value, 1.0);
+        assert_eq!(get("urine_epi").unwrap().value, 2.0); // Few
+        assert_eq!(get("urine_bacteria").unwrap().value, 1.0); // Few
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn differential_rows_split_by_unit_hint() {
+        let text = "\
+CBC with Differential
+Neutrophils  58.0  40.0-70.0  %
+Neutrophils (Absolute)  2.4  1.4-7.0
+x10E3/uL
+Lymphocytes (Absolute)  1.2  1.0-3.5
+x10E3/uL";
+        let mut warnings = vec![];
+        let markers = parse_markers(text, &mut warnings);
+        let neut_pct = markers.iter().find(|m| m.key == "neut_pct").unwrap();
+        assert_eq!(neut_pct.value, 58.0);
+        let neut_abs = markers.iter().find(|m| m.key == "neut_abs").unwrap();
+        assert_eq!(neut_abs.value, 2.4);
+        // the wrapped "x10E3/uL" line is folded into the row's cells
+        assert_eq!(neut_abs.unit, "x10E3/uL");
+        let lymph_abs = markers.iter().find(|m| m.key == "lymph_abs").unwrap();
+        assert_eq!(lymph_abs.value, 1.2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parses_cmp_protein_and_electrolyte_rows() {
+        let text = "\
+Comp. Metabolic Panel (14)
+Glucose              81     70-99 mg/dL
+BUN                  11     6-20 mg/dL
+Creatinine           0.98   0.57-1.00
+mg/dL
+BUN/Creatinine       11     9-23
+Ratio
+Sodium               139    134-144
+mmol/L
+Potassium            4.3    3.5-5.2 mmol/L
+Carbon Dioxide,      24     20-29 mmol/L
+Total
+Protein, Total       6.8    6.0-8.5 g/dL
+Albumin              4.4    3.9-4.9 g/dL
+Globulin, Total      2.4    1.5-4.5 g/dL
+Alkaline             40     41-116 IU/L
+Phosphatase";
+        let mut warnings = vec![];
+        let markers = parse_markers(text, &mut warnings);
+        let get = |k: &str| markers.iter().find(|m| m.key == k);
+        assert_eq!(get("protein_total").unwrap().value, 6.8);
+        assert_eq!(get("globulin").unwrap().value, 2.4);
+        assert_eq!(get("albumin").unwrap().value, 4.4);
+        assert_eq!(get("bun_cr_ratio").unwrap().value, 11.0);
+        assert_eq!(get("urea").unwrap().value, 11.0); // plain BUN row still maps to urea
+        assert_eq!(get("sodium").unwrap().value, 139.0);
+        assert_eq!(get("sodium").unwrap().unit, "mmol/L"); // wrapped unit line
+        assert_eq!(get("potassium").unwrap().value, 4.3);
+        assert_eq!(get("co2_total").unwrap().value, 24.0);
+        assert_eq!(get("alp").unwrap().value, 40.0);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -1614,6 +2326,7 @@ Data de inscrição: 09/09/2025   09:16:41
                 key: "glucose".into(),
                 raw_name: "Glucose".into(),
                 value: 87.0,
+                value_text: None,
                 unit: "mg/dL".into(),
                 low: Some(74.0),
                 high: Some(106.0),
@@ -1694,6 +2407,7 @@ Data de inscrição: 09/09/2025   09:16:41
             key: "glucose".into(),
             raw_name: "Glucose".into(),
             value: 87.0,
+            value_text: None,
             unit: "mg/dL".into(),
             low: Some(74.0),
             high: Some(106.0),
