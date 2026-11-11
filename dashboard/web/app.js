@@ -1583,8 +1583,12 @@ function batteryChart(pts) {
   wrap.append(foot);
 
   const cursor = plot.querySelector(".batt-cursor");
+  const svg = plot.querySelector("svg");
   const at = (e) => {
-    const r = plot.getBoundingClientRect();
+    // Measure the SVG, not the .batt-plot wrapper: the wrapper has padding-right
+    // for the % labels, and getBoundingClientRect() includes padding, which
+    // skews the mapping progressively toward the right edge.
+    const r = svg.getBoundingClientRect();
     const t = t0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * span;
     const p = pts.reduce((a, b) => (Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a));
     cursor.setAttribute("x1", x(p[0]).toFixed(2));
