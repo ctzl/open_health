@@ -57,6 +57,23 @@ per-ring via rings.auth_key_hex); sharing one profile across rings.
 - Serial resolution helper: `?serial=` param wins, else `ouradash_ring`
   cookie (name in app.js `RING_COOKIE`), else None.
 
+### 3.4 Demographics ("Your details") — per-profile
+Age / sex / height / weight / ring size feed the CVA (and other) models, so
+they MUST be per-person, not global. `profile.json` (next to `oura.db`) is now
+a **map of ring serial → demographics**; the `""` key is the default entry,
+used for unassigned requests and as the fallback for rings with no entry of
+their own. Legacy single-object files are migrated to `{ "": {...} }` on read.
+- `oura-summary`: `read_profile_for(db, serial)` / `write_profile_for(db,
+  serial, v)`; `read_profile`/`write_profile` are the `""`-key wrappers (CLI
+  `--age/--sex/...` seed the default on first run).
+- `build_summary` resolves the ring serial first, then loads that ring's
+  demographics — so the CVA model and the summary's `profile` block always
+  describe the ring being shown, not a global.
+- Routes: `GET /api/profile?serial=` → that ring's demographics (falls back to
+  the default); `POST /api/profile` body carries `serial` (empty = default).
+- Frontend: the "Your details" dialog reads the summary's `profile` (already
+  ring-scoped) and `saveProfile` stamps `serial: CURRENT_SERIAL`.
+
 ## 4. Frontend (`dashboard/web/`)
 - Share the existing switcher pattern from `app.js` (lines ~2317-2370):
   same `RING_COOKIE` cookie so the choice is ONE state across all pages.

@@ -23,7 +23,9 @@ use oura_summary::{
 };
 // Re-exported so `dashboard::Demographics` (main.rs) and the profile/feature
 // handlers keep working after the summary logic moved into `oura-summary`.
-pub use oura_summary::{read_profile, write_feature_mode, write_profile, Demographics};
+pub use oura_summary::{
+    read_profile_for, write_feature_mode, write_profile, write_profile_for, Demographics,
+};
 
 const INDEX_HTML: &str = include_str!("../../../dashboard/web/index.html");
 const STYLES_CSS: &str = include_str!("../../../dashboard/web/styles.css");
@@ -1439,13 +1441,19 @@ async fn handle(
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }
-        ("GET", "/api/profile") => json_resp(&mut sock, &read_profile(&db).to_json()).await,
+        ("GET", "/api/profile") => {
+            let serial = query_param(query, "serial").unwrap_or_default();
+            json_resp(&mut sock, &read_profile_for(&db, &serial).to_json()).await
+        }
         ("POST", "/api/profile") => {
             match serde_json::from_str::<Value>(body.trim_end_matches('\0')) {
-                Ok(v) => match write_profile(&db, &v) {
-                    Ok(d) => json_resp(&mut sock, &d.to_json()).await,
-                    Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
-                },
+                Ok(v) => {
+                    let serial = v["serial"].as_str().unwrap_or("").to_string();
+                    match write_profile_for(&db, &serial, &v) {
+                        Ok(d) => json_resp(&mut sock, &d.to_json()).await,
+                        Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+                    }
+                }
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }

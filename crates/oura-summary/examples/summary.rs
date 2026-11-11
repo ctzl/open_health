@@ -29,9 +29,9 @@ fn main() {
     let what = args.next().unwrap_or_default();
 
     let value = if what == "hourly_hr" {
-        oura_summary::hourly_hr::hourly_hr(Path::new(&db), tz, 0)
+        oura_summary::hourly_hr::hourly_hr(Path::new(&db), tz, 0, None)
     } else {
-        oura_summary::build_summary(Path::new(&db), tz, &oura_summary::NoModelRunner)
+        oura_summary::build_summary(Path::new(&db), tz, None, &oura_summary::NoModelRunner)
     };
     match value {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),

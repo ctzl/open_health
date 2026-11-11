@@ -66,10 +66,12 @@ so. To stage with Oura's own validated model instead:
   reach your ring, e.g. `--name "Oura Ring 5" --key-file captures/android/oura-android-auth.key`.
 - **Battery**: read offline from the ring's stored `battery_level_changed` debug
   events; shown in the header and the Device panel.
-- **Your details** (the person icon): edit age / sex / height / weight / ring size.
-  The ring can't measure these, so they live in an editable, gitignored
-  `profile.json` next to `oura.db` and feed the cardiovascular-age model (the runners
-  read it too). `--age/--sex/--height/--weight` only seed it on first run.
+- **Your details** (the person icon): edit age / sex / height / weight / ring
+  size for **the profile (ring) currently selected**. The ring can't measure
+  these, so they live in an editable, gitignored `profile.json` next to
+  `oura.db` — keyed per ring serial, with a `""` default for unassigned rings —
+  and feed the cardiovascular-age model (the runners read it too).
+  `--age/--sex/--height/--weight` only seed the default on first run.
 - **Activity**: detected sessions (Oura's `automatic_activity_detection`) plotted on a
   per-day actogram over a continuous MET "movement ridge"; tap a session for its time,
   duration, model label, and **estimated active calories** (Σ(MET−1)·weight/60).

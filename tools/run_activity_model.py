@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 
-from _common import resolve_db, resolve_models_dir
+from _common import read_profile, resolve_db, resolve_models_dir
 from activity_features import decoder_to_aad, unpack_real_step
 from epoch_time import build_epochs, is_dated, make_unix_s
 from event_cache import EventSource, UnitCache, _pred
@@ -317,13 +317,11 @@ def build_signals(rows, epochs, unix_seconds):
     return signals
 
 
-def profile_vector(db_path):
-    """Demographics from profile.json next to the DB (what the iOS app and the CVA
-    runner use); the model takes [age, sex(M=1), height_m, weight_kg]."""
-    try:
-        profile = json.loads((Path(db_path).parent / "profile.json").read_text())
-    except Exception:
-        profile = {}
+def profile_vector(db_path, serial=None):
+    """Demographics from profile.json next to the DB for this ring (what the
+    iOS app and the CVA runner use); the model takes
+    [age, sex(M=1), height_m, weight_kg]."""
+    profile = read_profile(db_path, serial)
     return [float(profile.get("age") or 30),
             1.0 if str(profile.get("sex", "M")).upper() == "M" else 0.0,
             float(profile.get("height_m") or 1.78), float(profile.get("weight_kg") or 75)]
@@ -438,7 +436,7 @@ def main():
     db_path = resolve_db(args.db, REPO)
     if not MODEL.exists():
         sys.exit(f"error: model not found: {MODEL}")
-    args.user_vector = profile_vector(db_path)
+    args.user_vector = profile_vector(db_path, args.serial)
     fp = hashlib.sha256(json.dumps([
         STATE_VERSION, MODEL.name, MODEL_VERSION, args.threshold, args.min_duration,
         args.user_vector, args.tz, args.no_stepmotion, os.environ.get("ACM_SCALE", "1"),

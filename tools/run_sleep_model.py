@@ -21,7 +21,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from _common import resolve_db, resolve_models_dir
+from _common import read_profile as _read_profile_for, resolve_db, resolve_models_dir
 from epoch_time import build_epochs, is_dated, make_unix_s
 from nssa_inputs import TAG_BEDTIME, collect_nssa_inputs
 from ibi_correction import correct_ibis
@@ -54,13 +54,11 @@ if len(rest) > 1:
 DB = resolve_db(db_arg, REPO)
 
 
-def read_profile(db):
-    """profile.json next to the DB (same defaults as oura-summary Demographics)."""
+def read_profile(db, serial=None):
+    """profile.json next to the DB, for this ring (same defaults as
+    oura-summary Demographics)."""
     profile = {"sex": "M", "age": 30.0, "height_m": 1.78, "weight_kg": 75.0}
-    try:
-        profile.update(json.loads((Path(db).parent / "profile.json").read_text()))
-    except (OSError, ValueError):
-        pass
+    profile.update(_read_profile_for(db, serial))
     return profile
 
 
@@ -192,7 +190,7 @@ def score_window(start_ds, end_ds, captured_unix=None):
          and json.loads(js).get("bedtime_start_ds") == start_ds), rows[-1][3] if rows else 0)
     if not is_dated(_epochs, start_ds, bed_cu) or not is_dated(_epochs, end_ds, bed_cu):
         return "sleep window clock is undated or ambiguous", None, None
-    profile = read_profile(DB)
+    profile = read_profile(DB, SERIAL)
     from nssa_stager import demographics
     demo = demographics(profile["age"], profile["height_m"], profile["weight_kg"], profile["sex"])
     beds = ring_bedtimes(start_ds, end_ds, bed_cu)

@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from _common import resolve_db, resolve_models_dir
+from _common import read_profile, resolve_db, resolve_models_dir
 
 REPO = Path(__file__).resolve().parent.parent
 SEG_LEN = 1500          # samples per segment (hard model constant)
@@ -110,13 +110,10 @@ def build_segments(db, since_ds, serial=None):
     return segs, seg_ts, len(runs)
 
 
-def load_profile(db):
-    # profile.json (editable, gitignored) sits next to the DB; CLI args override it.
-    import json
-    try:
-        return json.loads((Path(db).parent / "profile.json").read_text())
-    except Exception:
-        return {}
+def load_profile(db, serial=None):
+    # profile.json (editable, gitignored) sits next to the DB, keyed per ring
+    # serial; CLI args override it.
+    return read_profile(db, serial)
 
 
 def main():
@@ -135,7 +132,7 @@ def main():
     model_path = find_model()
 
     db = resolve_db(args.db, REPO)
-    prof = load_profile(db)
+    prof = load_profile(db, args.serial)
     pick = lambda cli, key, dflt: cli if cli is not None else prof.get(key, dflt)
     args.sex = pick(args.sex, "sex", "M")
     args.age = float(pick(args.age, "age", 30.0))
