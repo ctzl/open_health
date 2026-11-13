@@ -31,6 +31,10 @@ const ANCHOR_AGREEMENT_FRACTION: f64 = 0.02;
 // A few hours tolerate clock corrections/timezone setup without allowing a replayed
 // pre-reboot high ds value to fabricate weeks of future data.
 const FUTURE_SLACK_S: f64 = 6.0 * 3600.0;
+// The client's time_sync can arrive a moment before the ring records its own
+// ring_start, so the boot marker can sit just *past* the first post-stall anchor.
+// A minute absorbs that race without letting a later boot leak into this bracket.
+const BOOT_ANCHOR_SLACK_DS: i64 = 60 * 10;
 
 /// Why an event or sleep window could not be placed on the calendar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -269,11 +273,13 @@ impl RingClock {
                     // A ring_start between the anchors marks the stall exactly; without
                     // one, the download time tells which side an event sits on (wrong
                     // when pre-stall events were only downloaded after the stall).
+                    // The boot may also sit a few seconds past `after` when the client
+                    // anchored the new boot before the ring stored its ring_start.
                     let boots: Vec<_> = epoch
                         .boots
                         .iter()
                         .copied()
-                        .filter(|b| *b > before.0 && *b <= after.0)
+                        .filter(|b| *b > before.0 && *b <= after.0 + BOOT_ANCHOR_SLACK_DS)
                         .collect();
                     let first = boots.iter().min().copied();
                     let boot = boots.iter().max().copied();
@@ -685,6 +691,44 @@ mod tests {
         );
         let late = clock.resolve(25_000_000, captured);
         assert!((late.unix - (after.1 as f64 - (after.0 - 25_000_000) as f64 / 10.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn boot_just_past_first_post_stall_anchor_still_splits_the_stall() {
+        // a ring, Nov 2026: powered off ~20 h. The client's time_sync landed a
+        // decisecond before the ring recorded its own ring_start, so the boot marker
+        // sits just past the first post-stall anchor. Pre-stall events downloaded at
+        // that sync must still keep the pre-stall offset, not the post-boot one.
+        let before = (364_624_185_i64, 1_794_459_150_i64);
+        let after = (364_673_630_i64, 1_794_537_389_i64);
+        let boot = after.0 + 1;
+        let captured = after.1 + 26;
+        let clock = RingClock::from_events(&[
+            event(
+                before.0,
+                0x42,
+                &format!(r#"{{"unix_time":{},"source":"phone"}}"#, before.1),
+                before.1,
+            ),
+            event(364_650_000, 1, "{}", captured),
+            event(boot, 0x41, "{}", captured),
+            event(
+                after.0,
+                0x42,
+                &format!(r#"{{"unix_time":{}}}"#, after.1),
+                captured,
+            ),
+        ]);
+        let early = clock.resolve(364_650_000, captured);
+        assert_eq!(early.source, ClockSource::Anchor);
+        assert!(
+            (early.unix - (before.1 as f64 + (364_650_000 - before.0) as f64 / 10.0)).abs() < 0.01
+        );
+        // The boot's own first events keep the post-boot offset.
+        let late = clock.resolve(boot + 100, captured);
+        assert_eq!(late.source, ClockSource::Anchor);
+        let expected = after.1 as f64 + (boot + 100 - after.0) as f64 / 10.0;
+        assert!((late.unix - expected).abs() < 0.01);
     }
 
     #[test]
