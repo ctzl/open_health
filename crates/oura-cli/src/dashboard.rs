@@ -786,6 +786,64 @@ fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value
     Ok((value, false))
 }
 
+// ── hourly-HR cache ───────────────────────────────────────────────────────────
+// hr_bins decodes every HR event in the DB (~2.4 s over a full history) and the
+// day view refetches the whole series on every day switch. Memoise per
+// (db, serial, tz, bin size, days) and invalidate on the same DB data_version +
+// decoder version the summary cache uses, so a sync refreshes it transparently.
+struct HrCache {
+    db: PathBuf,
+    serial: String, // "" = all rings (no ?serial=)
+    tz: f64,
+    minutes: u32,
+    days: u32,
+    version: (i64, i64),
+    body: Arc<Vec<u8>>, // serialized once; the warm path writes these bytes verbatim
+}
+
+fn hr_cache() -> &'static Mutex<Vec<HrCache>> {
+    static C: OnceLock<Mutex<Vec<HrCache>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_hr_bins(
+    db: &Path,
+    tz: f64,
+    days: u32,
+    minutes: u32,
+    serial: Option<&str>,
+) -> Result<Arc<Vec<u8>>> {
+    let version = (db_data_version(db), oura_store::storage::DECODER_VERSION);
+    let key_serial = serial.unwrap_or_default();
+    let same = |c: &HrCache| {
+        c.db == db && c.serial == key_serial && c.tz == tz && c.minutes == minutes && c.days == days
+    };
+    {
+        let guard = hr_cache().lock().unwrap();
+        if let Some(c) = guard.iter().find(|c| same(c) && c.version == version) {
+            return Ok(c.body.clone());
+        }
+    }
+    let body = Arc::new(serde_json::to_vec(
+        &oura_summary::hourly_hr::hr_bins(db, tz, days, minutes, serial)?,
+    )?);
+    let mut guard = hr_cache().lock().unwrap();
+    // don't clobber a fresher entry a concurrent request already stored
+    if !guard.iter().any(|c| same(c) && c.version > version) {
+        guard.retain(|c| !same(c));
+        guard.push(HrCache {
+            db: db.to_path_buf(),
+            serial: key_serial.to_string(),
+            tz,
+            minutes,
+            days,
+            version,
+            body: body.clone(),
+        });
+    }
+    Ok(body)
+}
+
 pub async fn serve(
     port: u16,
     lan: bool,
@@ -1370,12 +1428,12 @@ async fn handle(
                     .as_deref()
                     .map(|s| resolve_summary_serial(&db, Some(s)))
                     .transpose()?;
-                oura_summary::hourly_hr::hr_bins(&db, effective_tz, days, minutes, serial.as_deref())
+                cached_hr_bins(&db, effective_tz, days, minutes, serial.as_deref())
             })
             .await
             .map_err(|e| anyhow!(e))?;
             match body {
-                Ok(v) => json_resp(&mut sock, &v).await,
+                Ok(bytes) => write_resp(&mut sock, "200 OK", "application/json", &bytes).await,
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }
