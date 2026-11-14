@@ -607,17 +607,38 @@ type CacheToken = (
     i64,
 );
 
-/// SQLite's change counter for the DB: bumps only when a connection commits a
-/// data change. The file mtime is NOT a safe proxy — any read-write open
-/// checkpoints the WAL and bumps mtime without changing data, which made the
-/// cache thrash (and re-ran every torch model) after each sync, live-HR
-/// session, or even the summary build's own migration probe.
+/// SQLite change signal for the DB, for derived-data cache keys.
+///
+/// `PRAGMA data_version` alone is NOT sufficient in WAL mode: a fresh read-only
+/// connection reads the change counter from the DB file header, which only
+/// advances when the WAL is checkpointed — so a sync's commits can stay
+/// invisible to the probe for an arbitrarily long time (observed: HR cache
+/// served stale minutes after a sync). MAX(rowid) of the tables a sync writes
+/// is visible to every WAL reader the instant the commit lands; combine both
+/// (data_version still catches updates/deletes that leave rowids alone).
+/// The file mtime is NOT a safe proxy either — any read-write open checkpoints
+/// the WAL and bumps mtime without changing data, which made the cache thrash
+/// (and re-ran every torch model) after each sync, live-HR session, or even the
+/// summary build's own migration probe.
 fn db_data_version(db: &Path) -> i64 {
     rusqlite::Connection::open_with_flags(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .and_then(|c| c.query_row("PRAGMA data_version", [], |r| r.get(0)))
+    .and_then(|c| {
+        let dv: i64 = c.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        let (ev, rd, dev): (Option<i64>, Option<i64>, Option<i64>) = c.query_row(
+            "SELECT (SELECT MAX(rowid) FROM events), \
+                    (SELECT MAX(rowid) FROM readings), \
+                    (SELECT MAX(rowid) FROM device)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(dv
+            ^ ev.unwrap_or(0).wrapping_mul(0x9e37_79b9_7f4a_7c15u64.cast_signed())
+            ^ rd.unwrap_or(0).wrapping_mul(0x632b_e658_f119_47a3)
+            ^ dev.unwrap_or(0).wrapping_mul(0x8950_4f4d_59ce_4fdbu64.cast_signed()))
+    })
     .unwrap_or(0)
 }
 
