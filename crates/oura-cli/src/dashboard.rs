@@ -1589,11 +1589,15 @@ async fn handle(
             let req = serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
             let target = req["serial"].as_str().unwrap_or("").trim().to_string();
             let (serial, key_file) = resolve_ring_target(&db, &target, key_file.as_deref());
+            let db2 = db.clone();
             let res = tokio::task::spawn_blocking(move || {
                 run_sync(&db, &name, &serial, key_file.as_deref())
             })
                 .await
                 .map_err(|e| anyhow!(e))?;
+            if res.is_ok() {
+                warm_summaries(&db2);
+            }
             let v = match res {
                 Ok(msg) => json!({ "ok": true, "message": msg }),
                 Err(e) => json!({ "ok": false, "message": e.to_string() }),
@@ -1664,6 +1668,24 @@ fn target_args(c: &mut Command, name: &str, serial: &str) {
         c.arg("--name").arg(name);
     } else {
         c.arg("--expect-serial").arg(serial);
+    }
+}
+
+/// After a successful sync, proactively spawn summary rebuilds for every cached
+/// (tz, serial). The recompute is otherwise request-driven: it only starts when
+/// some page happens to ask for a summary after the token changed — so a sync
+/// whose tab was closed or backgrounded mid-run leaves the models idle for
+/// minutes. Reuses cached_summary's token check + in-flight guard, so this is
+/// a no-op when nothing changed or a rebuild is already running.
+fn warm_summaries(db: &Path) {
+    let targets: Vec<(f64, String)> = summary_cache()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| (c.tz, c.serial.clone()))
+        .collect();
+    for (tz, serial) in targets {
+        let _ = cached_summary(db, tz, Some(&serial));
     }
 }
 
