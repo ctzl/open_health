@@ -810,14 +810,18 @@ fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value
 // ── hourly-HR cache ───────────────────────────────────────────────────────────
 // hr_bins decodes every HR event in the DB (~2.4 s over a full history) and the
 // day view refetches the whole series on every day switch. Memoise per
-// (db, serial, tz, bin size, days) and invalidate on the same DB data_version +
-// decoder version the summary cache uses, so a sync refreshes it transparently.
+// (db, serial, tz, bin size, days, window) and invalidate on the same DB
+// data_version + decoder version the summary cache uses, so a sync refreshes it
+// transparently. The windowed day path (from/to set) is an index seek and still
+// memoises — switching back to a day you just looked at should be instant.
 struct HrCache {
     db: PathBuf,
     serial: String, // "" = all rings (no ?serial=)
     tz: f64,
     minutes: u32,
     days: u32,
+    from: i64, // resolved-unix window; i64::MIN = unbounded (full path)
+    to: i64,
     version: (i64, i64),
     body: Arc<Vec<u8>>, // serialized once; the warm path writes these bytes verbatim
 }
@@ -834,10 +838,28 @@ fn cached_hr_bins(
     minutes: u32,
     serial: Option<&str>,
 ) -> Result<Arc<Vec<u8>>> {
+    cached_hr_window(db, tz, days, minutes, serial, i64::MIN, i64::MAX)
+}
+
+fn cached_hr_window(
+    db: &Path,
+    tz: f64,
+    days: u32,
+    minutes: u32,
+    serial: Option<&str>,
+    from: i64,
+    to: i64,
+) -> Result<Arc<Vec<u8>>> {
     let version = (db_data_version(db), oura_store::storage::DECODER_VERSION);
     let key_serial = serial.unwrap_or_default();
     let same = |c: &HrCache| {
-        c.db == db && c.serial == key_serial && c.tz == tz && c.minutes == minutes && c.days == days
+        c.db == db
+            && c.serial == key_serial
+            && c.tz == tz
+            && c.minutes == minutes
+            && c.days == days
+            && c.from == from
+            && c.to == to
     };
     {
         let guard = hr_cache().lock().unwrap();
@@ -845,9 +867,12 @@ fn cached_hr_bins(
             return Ok(c.body.clone());
         }
     }
-    let body = Arc::new(serde_json::to_vec(
-        &oura_summary::hourly_hr::hr_bins(db, tz, days, minutes, serial)?,
-    )?);
+    let value = if from == i64::MIN {
+        oura_summary::hourly_hr::hr_bins(db, tz, days, minutes, serial)?
+    } else {
+        oura_summary::hourly_hr::hr_bins_window(db, tz, from, to, minutes, serial)?
+    };
+    let body = Arc::new(serde_json::to_vec(&value)?);
     let mut guard = hr_cache().lock().unwrap();
     // don't clobber a fresher entry a concurrent request already stored
     if !guard.iter().any(|c| same(c) && c.version > version) {
@@ -858,6 +883,8 @@ fn cached_hr_bins(
             tz,
             minutes,
             days,
+            from,
+            to,
             version,
             body: body.clone(),
         });
@@ -1444,12 +1471,22 @@ async fn handle(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60);
             let serial = query_param(query, "serial");
+            let from = query_param(query, "from").and_then(|v| v.parse::<i64>().ok());
+            let to = query_param(query, "to").and_then(|v| v.parse::<i64>().ok());
             let body = tokio::task::spawn_blocking(move || {
                 let serial = serial
                     .as_deref()
                     .map(|s| resolve_summary_serial(&db, Some(s)))
                     .transpose()?;
-                cached_hr_bins(&db, effective_tz, days, minutes, serial.as_deref())
+                let serial = serial.as_deref();
+                // With an explicit window, read only that window's rows instead
+                // of binning the whole history; both paths share the memo cache.
+                if let (Some(f), Some(t)) = (from, to) {
+                    if f < t {
+                        return cached_hr_window(&db, effective_tz, days, minutes, serial, f, t);
+                    }
+                }
+                cached_hr_bins(&db, effective_tz, days, minutes, serial)
             })
             .await
             .map_err(|e| anyhow!(e))?;

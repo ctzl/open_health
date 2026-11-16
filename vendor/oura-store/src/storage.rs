@@ -823,6 +823,105 @@ impl Store {
         Ok(rows)
     }
 
+    /// Decoded events restricted to `tags` and a ring-counter window
+    /// `[ds_from, ds_to]`, ordered by capture order. The counter runs
+    /// monotonically per device across reboots, so a unix window can be
+    /// projected into this space through the ring clock's anchors and widened
+    /// generously; callers must still resolve and filter precisely afterwards.
+    /// Served by `idx_events_tag_time`, which turns "one day of heart rate"
+    /// from a full-history scan into an index seek.
+    pub fn decoded_events_tagged_window(
+        &self,
+        serial: Option<&str>,
+        tags: &[u8],
+        ds_from: i64,
+        ds_to: i64,
+    ) -> Result<Vec<(i64, u8, String, i64)>> {
+        let marks = vec!["?"; tags.len()].join(",");
+        let serial_clause = if serial.is_some() { " AND serial = ?" } else { "" };
+        let sql = format!(
+            "SELECT ring_timestamp, tag, decoded_json, captured_unix, \
+                    CASE WHEN decoded_json IS NULL THEN body ELSE NULL END \
+             FROM events \
+             WHERE tag IN ({marks}) AND ring_timestamp BETWEEN ? AND ? \
+               AND (decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14)){serial_clause} \
+             ORDER BY captured_unix, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(i64, u8, String, i64)> {
+            let ts = r.get::<_, i64>(0)?;
+            let tag = r.get::<_, i64>(1)? as u8;
+            let decoded_opt = r.get::<_, Option<String>>(2)?;
+            let captured = r.get::<_, i64>(3)?;
+            let json = match decoded_opt {
+                Some(s) => s,
+                None => {
+                    let body = r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+                    decode_stored_event(tag, &body, None).unwrap_or_else(|| "{}".to_string())
+                }
+            };
+            Ok((ts, tag, json, captured))
+        };
+        let mut args: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for t in tags {
+            args.push(t);
+        }
+        args.push(&ds_from);
+        args.push(&ds_to);
+        let serial_str = serial.unwrap_or("");
+        if serial.is_some() {
+            args.push(&serial_str);
+        }
+        let rows = stmt
+            .query_map(args.as_slice(), map_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every event the full-read path would surface, as
+    /// `(ring_timestamp, tag, json, captured_unix)` in capture order, but
+    /// carrying JSON only for the ring-clock anchor tags (time_sync, rtc_beacon).
+    /// The row filter matches [`Store::decoded_events_filtered`] exactly, so the
+    /// epoch split is identical to the full path's — without shipping
+    /// megabytes of HR payloads.
+    pub fn clock_rows(&self, serial: Option<&str>) -> Result<Vec<(i64, u8, String, i64)>> {
+        let serial_clause = if serial.is_some() { " AND serial = ?" } else { "" };
+        let sql = format!(
+            "SELECT ring_timestamp, tag, \
+                    CASE WHEN tag IN (66, 133) THEN decoded_json END, \
+                    captured_unix, \
+                    CASE WHEN tag IN (66, 133) AND decoded_json IS NULL THEN body END \
+             FROM events \
+             WHERE (decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14)){serial_clause} \
+             ORDER BY captured_unix, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(i64, u8, String, i64)> {
+            let ts = r.get::<_, i64>(0)?;
+            let tag = r.get::<_, i64>(1)? as u8;
+            let captured = r.get::<_, i64>(3)?;
+            let json = match r.get::<_, Option<String>>(2)? {
+                Some(s) => s,
+                None => match r.get::<_, Option<Vec<u8>>>(4)? {
+                    Some(body) => {
+                        decode_stored_event(tag, &body, None).unwrap_or_else(|| "{}".to_string())
+                    }
+                    None => "{}".to_string(),
+                },
+            };
+            Ok((ts, tag, json, captured))
+        };
+        let rows = match serial {
+            Some(s) => stmt
+                .query_map([s], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
     /// Count `(raw_events, decoded_events)` across the store.
     pub fn event_totals(&self) -> Result<(usize, usize)> {
         let (raw, decoded): (i64, i64) = self.conn.query_row(

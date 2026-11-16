@@ -34,7 +34,8 @@
 //! number as the dashboard cell.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -159,10 +160,136 @@ pub fn hr_bins(
     }
     let clock = RingClock::from_events(&events);
 
+    let (mut bins, latest) = bin_events(&events, &clock, span, tz, None);
+
+    if days > 0 {
+        if let Some(newest) = bins.keys().next_back().copied() {
+            let cut = newest - days as i64 * 86_400;
+            bins.retain(|start, _| *start >= cut);
+        }
+    }
+
+    Ok(bins_json(&bins, tz, minutes, latest))
+}
+
+/// The same bars restricted to resolved-unix window `[from_unix, to_unix)` —
+/// the day view's path. Reading one day this way must not decode the whole
+/// history: the clock map is built from the ring's own clock events (a few
+/// hundred rows), and HR rows are fetched by ring-counter window via
+/// [`RingClock::ds_window`], an index seek on `idx_events_tag_time`. Samples
+/// resolving outside the window are dropped during binning, so for a
+/// bin-aligned range (the day view: local midnight, whole days) the result is
+/// exactly what [`hr_bins`] would produce for that range. `latest` is the
+/// newest in-window sample.
+pub fn hr_bins_window(
+    db: &Path,
+    tz: impl Into<crate::OffsetHours>,
+    from_unix: i64,
+    to_unix: i64,
+    minutes: u32,
+    serial: Option<&str>,
+) -> Result<Value> {
+    let tz = tz.into().0;
+    if minutes == 0 || 60 % minutes != 0 {
+        anyhow::bail!("bin size must divide an hour, got {minutes} minutes");
+    }
+    anyhow::ensure!(tz.is_finite() && (-24.0..=24.0).contains(&tz), "invalid UTC offset");
+    anyhow::ensure!(from_unix < to_unix, "empty window");
+    let span = minutes as i64 * 60;
+    let clock = cached_clock(db, serial)?;
+    let Some((ds_lo, ds_hi)) = clock.ds_window(from_unix, to_unix, DS_WINDOW_MARGIN_DS) else {
+        // No anchors anywhere: only the full path's undated predictions can
+        // place these samples, and that reads everything anyway.
+        return hr_bins(db, tz, 0, minutes, serial);
+    };
+    let store = Store::open_read_only(db).context("opening DB")?;
+    let events = store
+        .decoded_events_tagged_window(serial, HR_TAGS, ds_lo, ds_hi)
+        .context("reading HR events")?;
+    let (bins, latest) = bin_events(&events, &clock, span, tz, Some((from_unix, to_unix)));
+    Ok(bins_json(&bins, tz, minutes, latest))
+}
+
+// ── ring-clock cache ───────────────────────────────────────────────────────────
+// A RingClock's epoch split follows counter discontinuities anywhere in the
+// event stream, so a windowed read cannot build its own clock from a slice of
+// it — it needs the full ds/capture sequence. That sequence is stable until
+// the DB changes, so memoise it per (db, serial, data fingerprint): the full
+// scan is paid once per sync, not once per day view.
+struct ClockCache {
+    db: PathBuf,
+    serial: String, // "" = all rings
+    version: (i64, Option<i64>, i64),
+    clock: Arc<RingClock>,
+}
+
+fn clock_cache() -> &'static Mutex<Vec<ClockCache>> {
+    static C: OnceLock<Mutex<Vec<ClockCache>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_clock(db: &Path, serial: Option<&str>) -> Result<Arc<RingClock>> {
+    let version = clock_version(db)?;
+    let key_serial = serial.unwrap_or_default();
+    {
+        let guard = clock_cache().lock().unwrap();
+        if let Some(c) = guard
+            .iter()
+            .find(|c| c.db == db && c.serial == key_serial && c.version == version)
+        {
+            return Ok(c.clock.clone());
+        }
+    }
+    let store = Store::open_read_only(db).context("opening DB")?;
+    let rows = store.clock_rows(serial).context("reading clock rows")?;
+    let clock = Arc::new(RingClock::from_events(&rows));
+    let mut guard = clock_cache().lock().unwrap();
+    guard.retain(|c| c.version == version);
+    guard.push(ClockCache {
+        db: db.to_path_buf(),
+        serial: key_serial.to_string(),
+        version,
+        clock: clock.clone(),
+    });
+    Ok(clock)
+}
+
+/// Cheap fingerprint of the event data: `PRAGMA data_version` moves on writes
+/// from other connections, the events max-rowid catches appends from this one.
+/// The decoder version covers re-decodes of undecoded bodies.
+fn clock_version(db: &Path) -> Result<(i64, Option<i64>, i64)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("opening DB")?;
+    let dv: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    let max_rowid: Option<i64> = conn.query_row("SELECT MAX(rowid) FROM events", [], |r| r.get(0))?;
+    Ok((dv, max_rowid, oura_store::storage::DECODER_VERSION))
+}
+
+/// Tags the chart is built from (`hrv_event`, `green_ibi_quality_event`).
+const HR_TAGS: &[u8] = &[0x5d, 0x80];
+/// Counter slack for [`RingClock::ds_window`]: intra-epoch drift is seconds,
+/// inter-anchor offsets are already unioned; 6 h is generous headroom.
+const DS_WINDOW_MARGIN_DS: i64 = 216_000;
+
+/// Bin every beat/average in `events` into local `span`-second slots.
+/// `window` optionally drops samples whose resolved unix time falls outside
+/// `[from, to)` — the counter window is widened, so this is what makes the
+/// result exact. Returns the bars plus the newest non-average sample
+/// `(unix, bpm)`.
+fn bin_events(
+    events: &[(i64, u8, String, i64)],
+    clock: &RingClock,
+    span: i64,
+    tz: f64,
+    window: Option<(i64, i64)>,
+) -> (BTreeMap<i64, Bar>, Option<(f64, f64)>) {
     let mut bins: BTreeMap<i64, Bar> = BTreeMap::new();
     let mut latest: Option<(f64, f64)> = None; // (unix, bpm)
 
-    for (ds, tag, jstr, cu) in &events {
+    for (ds, tag, jstr, cu) in events {
         let name = oura_protocol::events::event_name(*tag);
         if !matches!(name, "green_ibi_quality_event" | "hrv_event") {
             continue;
@@ -183,6 +310,11 @@ pub fn hr_bins(
                 continue;
             }
             let at = clock.unix_s(sample_ds, *cu);
+            if let Some((f, t)) = window {
+                if at < f as f64 || at >= t as f64 {
+                    continue;
+                }
+            }
             let bar = bins.entry(bucket_start(at, tz, span)).or_default();
             bar.add(bpm);
             if is_avg {
@@ -194,13 +326,16 @@ pub fn hr_bins(
         }
     }
 
-    if days > 0 {
-        if let Some(newest) = bins.keys().next_back().copied() {
-            let cut = newest - days as i64 * 86_400;
-            bins.retain(|start, _| *start >= cut);
-        }
-    }
+    (bins, latest)
+}
 
+/// The wire format: one row per slot, oldest first.
+fn bins_json(
+    bins: &BTreeMap<i64, Bar>,
+    tz: f64,
+    minutes: u32,
+    latest: Option<(f64, f64)>,
+) -> Value {
     let out: Vec<Value> = bins
         .iter()
         .map(|(start, bar)| {
@@ -222,12 +357,12 @@ pub fn hr_bins(
         })
         .collect();
 
-    Ok(json!({
+    json!({
         "tz_offset": tz,
         "minutes": minutes,
         "bins": out,
         "latest": latest.map(|(at, bpm)| json!({ "bpm": bpm, "unix": at.round() as i64 })),
-    }))
+    })
 }
 
 /// UTC start of the local-clock slot of `span` seconds (a divisor of an hour) a
@@ -434,6 +569,77 @@ mod tests {
         assert!(hr_bins(missing, 0, 0, 7, None).is_err());
         assert!(hr_bins(missing, 0, 0, 0, None).is_err());
         assert!(hr_bins(missing, 0, 0, 90, None).is_err());
+        assert!(hr_bins_window(missing, 0, 0, 86_400, 7, None).is_err());
+        assert!(hr_bins_window(missing, 0, 86_400, 0, 60, None).is_err());
+    }
+
+    /// The windowed path must agree with the full scan exactly: same bars,
+    /// same stats, and `latest` restricted to the window.
+    #[test]
+    fn windowed_bins_match_the_full_scan() {
+        use oura_protocol::events::RingEvent;
+
+        let dir = std::env::temp_dir().join(format!("oura-hourly-hr-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        let _ = std::fs::remove_file(&db);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let anchor = (now - 4 * 86_400) / HOUR * HOUR;
+
+        {
+            let store = Store::open(db.to_str().unwrap()).unwrap();
+            let push = |tag: u8, name: &'static str, ds: i64, decoded: Value| {
+                store
+                    .insert_event(
+                        "S1",
+                        &RingEvent {
+                            tag,
+                            name,
+                            timestamp: ds as u32,
+                            body: vec![0],
+                            decoded: Some(decoded),
+                        },
+                    )
+                    .unwrap();
+            };
+            push(0x42, "time_sync", 0, json!({ "unix_time": anchor }));
+            // one bar per day, +1 h into each
+            for (day, bpm) in [(0i64, 60), (1, 70), (2, 80), (3, 90)] {
+                push(
+                    0x80,
+                    "green_ibi_quality_event",
+                    day * 864_000 + 36_000,
+                    json!({ "hr_bpm": [bpm] }),
+                );
+            }
+        }
+
+        let full = hr_bins(&db, 0, 0, 60, None).unwrap();
+        let all = full["bins"].as_array().unwrap();
+        assert_eq!(all.len(), 4, "{full}");
+
+        // day 2 = [anchor + 24 h, anchor + 48 h): only the +25 h bar lives there
+        let from = anchor + 86_400;
+        let win = hr_bins_window(&db, 0, from, from + 86_400, 60, None).unwrap();
+        let want: Vec<&Value> = all
+            .iter()
+            .filter(|b| {
+                let u = b["unix"].as_i64().unwrap();
+                u >= from && u < from + 86_400
+            })
+            .collect();
+        let got = win["bins"].as_array().unwrap();
+        assert_eq!(got.len(), want.len(), "{win}");
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(*g, *w, "windowed bars must match the full scan");
+        }
+        assert_eq!(win["latest"]["bpm"], 70.0, "latest is the newest in-window sample");
+
+        let _ = std::fs::remove_file(&db);
     }
 
     /// 15-minute slots over a real store: beats split by quarter hour, and a slot
