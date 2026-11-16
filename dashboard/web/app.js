@@ -1391,7 +1391,12 @@ function heartSection(ymd, axis, cursor) {
     const seq = ++HR_SEQ; // a slower earlier response must not overwrite a newer one
     sw.querySelectorAll("button").forEach((b) => b.classList.toggle("on", +b.dataset.min === HR_BIN_MIN));
     chart.replaceChildren(el("div", "skeleton skeleton-block"));
-    fetch(`/api/hourly-hr?minutes=${HR_BIN_MIN}&tz=${browserTzOffset()}${ringQS()}`)
+    // Ask for exactly the day on screen: the server projects this window onto
+    // the ring's counter and reads only those rows, instead of binning the
+    // whole history and letting the browser slice it out again.
+    const tz = browserTzOffset();
+    const from = Date.UTC(+ymd.slice(0, 4), +ymd.slice(5, 7) - 1, +ymd.slice(8, 10)) / 1000 - tz * 3600;
+    fetch(`/api/hourly-hr?minutes=${HR_BIN_MIN}&tz=${tz}&from=${from}&to=${from + 86400}${ringQS()}`)
       .then((r) => r.json())
       .then((j) => {
         if (seq !== HR_SEQ) return;

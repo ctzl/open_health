@@ -521,6 +521,21 @@ impl RingClock {
             })
             .map(|(offset, _)| ds.saturating_add(*offset) as f64 / 10.0)
     }
+
+    /// The ring-counter (`ds`) range that could resolve into the unix window
+    /// `[from_unix, to_unix]`, for bounding a SQL read. Every anchor is a
+    /// candidate projection — a stall between an anchor and the window shifts
+    /// the unix↔ds offset — so this is the union over anchors, widened by
+    /// `margin_ds`. Callers must still resolve and filter precisely; this only
+    /// decides which rows are worth reading.
+    pub fn ds_window(&self, from_unix: i64, to_unix: i64, margin_ds: i64) -> Option<(i64, i64)> {
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for (offset, _) in &self.anchor_offsets_ds {
+            lo = lo.min(from_unix.saturating_mul(10).saturating_sub(*offset));
+            hi = hi.max(to_unix.saturating_mul(10).saturating_sub(*offset));
+        }
+        (lo <= hi).then(|| (lo.saturating_sub(margin_ds), hi.saturating_add(margin_ds)))
+    }
 }
 
 #[cfg(test)]
