@@ -1343,6 +1343,7 @@ dependencies = [
 [[package]]
 name = "oura-link"
 version = "0.1.0"
+source = "git+https://github.com/ctzl/open_oura?rev=ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf#ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf"
 dependencies = [
  "async-trait",
  "btleplug",
@@ -1358,6 +1359,7 @@ dependencies = [
 [[package]]
 name = "oura-protocol"
 version = "0.1.0"
+source = "git+https://github.com/ctzl/open_oura?rev=ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf#ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf"
 dependencies = [
  "aes",
  "hex",
