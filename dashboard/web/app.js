@@ -1410,7 +1410,7 @@ function heartSection(ymd, axis, cursor) {
         readout.innerHTML = "&nbsp;";
       });
   };
-  for (const [min, label] of [[15, "15 min"], [60, "1 h"]]) {
+  for (const [min, label] of [[5, "5 min"], [15, "15 min"], [60, "1 h"]]) {
     const b = el("button", "", label);
     b.type = "button";
     b.dataset.min = min;
