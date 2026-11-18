@@ -23,5 +23,5 @@ oura-store = { path = "vendor/oura-store" }
 # Use our pushed open_oura fork (Windows BLE scan fix, history cold-start fix)
 # instead of the pinned upstream rev. For local sibling development, temporarily
 # switch these back to { path = "../open_oura/crates/..." }.
-oura-protocol = { git = "https://github.com/ctzl/open_oura", rev = "ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf" }
-oura-link = { git = "https://github.com/ctzl/open_oura", rev = "ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf" }
+oura-protocol = { git = "https://github.com/ctzl/open_oura", rev = "ef001961506eb973500b462214af8a574712cd89" }
+oura-link = { git = "https://github.com/ctzl/open_oura", rev = "ef001961506eb973500b462214af8a574712cd89" }
