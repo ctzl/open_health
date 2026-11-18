@@ -2319,6 +2319,7 @@ async function load() {
       }, 8000);
     }
   } else {
+    if (RECOMPUTE_TRIES > 0) toast("Recompute finished — showing fresh data.", "ok");
     RECOMPUTE_TRIES = 0; // fresh data landed (or nothing was recomputing)
   }
 }

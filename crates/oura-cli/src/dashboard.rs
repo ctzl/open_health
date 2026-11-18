@@ -666,6 +666,62 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Sidecar holding the last built summary, next to the DB (same convention as
+/// profile.json). Lets a restarted server serve the previous run's summary on
+/// first paint instead of paying for the torch models before anything renders;
+/// the embedded token decides whether it is fresh or merely stale-but-shaped,
+/// exactly like the in-memory entry it seeds.
+fn summary_cache_path(db: &Path, serial: &str) -> PathBuf {
+    db.parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("summary_cache.{serial}.json"))
+}
+
+fn token_to_json(t: &CacheToken) -> Value {
+    let mt = |s: &Option<SystemTime>| {
+        s.map(|s| {
+            let d = s.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+            vec![d.as_secs() as i64, d.subsec_nanos() as i64]
+        })
+    };
+    json!([t.0, mt(&t.1), mt(&t.2), mt(&t.3), t.4])
+}
+
+fn token_from_json(v: &Value) -> Option<CacheToken> {
+    let a = v.as_array()?;
+    if a.len() != 5 {
+        return None;
+    }
+    let mt = |v: &Value| -> Option<Option<SystemTime>> {
+        if v.is_null() {
+            return Some(None);
+        }
+        let p = v.as_array()?;
+        Some(Some(
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(p[0].as_u64()?, p[1].as_u64()? as u32),
+        ))
+    };
+    Some((
+        a[0].as_i64()?,
+        mt(&a[1])?,
+        mt(&a[2])?,
+        mt(&a[3])?,
+        a[4].as_i64()?,
+    ))
+}
+
+fn load_summary_disk(db: &Path, tz: f64, serial: &str) -> Option<(CacheToken, Arc<Value>)> {
+    let env: Value =
+        serde_json::from_slice(&std::fs::read(summary_cache_path(db, serial)).ok()?).ok()?;
+    // the token is about the data, but the payload itself is rendered for a tz;
+    // a summary built under a different offset is not reusable
+    if env["tz"].as_f64()? != tz {
+        return None;
+    }
+    Some((token_from_json(&env["token"])?, Arc::new(env["value"].clone())))
+}
+
 /// Resolve `?serial=` against the registry: a unique prefix is accepted, and with
 /// exactly one registered ring an omitted serial resolves to it (single-ring DBs
 /// keep working unchanged).
@@ -707,21 +763,37 @@ fn store_summary(
     token: CacheToken,
     value: &Arc<Value>,
 ) {
-    let mut guard = summary_cache().lock().unwrap();
-    // don't clobber a fresher entry a concurrent build already stored (compare
-    // the DB mtime, which a sync advances)
-    let newer_exists = guard
-        .iter()
-        .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
-    if !newer_exists {
-        guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
-        guard.push(SummaryCache {
-            db: db.to_path_buf(),
-            tz,
-            serial: serial.to_string(),
-            token,
-            value: value.clone(),
-        });
+    let newer_exists = {
+        let mut guard = summary_cache().lock().unwrap();
+        // don't clobber a fresher entry a concurrent build already stored (compare
+        // the DB mtime, which a sync advances)
+        let newer = guard
+            .iter()
+            .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
+        if !newer {
+            guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
+            guard.push(SummaryCache {
+                db: db.to_path_buf(),
+                tz,
+                serial: serial.to_string(),
+                token: token.clone(),
+                value: value.clone(),
+            });
+        }
+        newer
+    };
+    if newer_exists {
+        return;
+    }
+    // Persist for the next process start (tmp+rename so a crash mid-write can't
+    // leave a half-written sidecar). ~1 MB per ring, once per rebuild.
+    let env = json!({ "tz": tz, "token": token_to_json(&token), "value": &**value });
+    let path = summary_cache_path(db, serial);
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(&env) {
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -735,7 +807,22 @@ fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value
     let token = summary_token(db);
     let key = format!("{}|{}", db.display(), serial);
     {
-        let guard = summary_cache().lock().unwrap();
+        let mut guard = summary_cache().lock().unwrap();
+        // Process restart: seed from the previous run's sidecar before deciding.
+        // A token match serves it as fresh below; a mismatch falls into the
+        // stale path, which serves it immediately and rebuilds in the background
+        // — the same stale-while-revalidate the in-memory cache already does.
+        if !guard.iter().any(|c| c.db == db && c.tz == tz && c.serial == serial) {
+            if let Some((disk_token, value)) = load_summary_disk(db, tz, &serial) {
+                guard.push(SummaryCache {
+                    db: db.to_path_buf(),
+                    tz,
+                    serial: serial.clone(),
+                    token: disk_token,
+                    value,
+                });
+            }
+        }
         if let Some(c) = guard
             .iter()
             .find(|c| c.db == db && c.tz == tz && c.serial == serial && c.token == token)
