@@ -576,7 +576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1343,7 +1343,7 @@ dependencies = [
 [[package]]
 name = "oura-link"
 version = "0.1.0"
-source = "git+https://github.com/ctzl/open_oura?rev=ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf#ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf"
+source = "git+https://github.com/ctzl/open_oura?rev=ef001961506eb973500b462214af8a574712cd89#ef001961506eb973500b462214af8a574712cd89"
 dependencies = [
  "async-trait",
  "btleplug",
@@ -1359,7 +1359,7 @@ dependencies = [
 [[package]]
 name = "oura-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ctzl/open_oura?rev=ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf#ac831ece4c1fec3e8dfd4da0f9ffcdcd7108bdaf"
+source = "git+https://github.com/ctzl/open_oura?rev=ef001961506eb973500b462214af8a574712cd89#ef001961506eb973500b462214af8a574712cd89"
 dependencies = [
  "aes",
  "hex",
@@ -2468,7 +2468,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
