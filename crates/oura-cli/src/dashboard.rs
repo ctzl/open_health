@@ -765,11 +765,14 @@ fn store_summary(
 ) {
     let newer_exists = {
         let mut guard = summary_cache().lock().unwrap();
-        // don't clobber a fresher entry a concurrent build already stored (compare
-        // the DB mtime, which a sync advances)
+        // don't clobber an entry a concurrent build already stored for this exact
+        // state. token.0 is an XOR hash over the change counters — its magnitude
+        // carries no ordering (a sync can make it *drop*, which would make any
+        // older entry look "newer" and block storing forever). Callers only store
+        // under the current token, so an entry equal to this token is up to date.
         let newer = guard
             .iter()
-            .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token.0 > token.0);
+            .any(|c| c.db == db && c.tz == tz && c.serial == serial && c.token == token);
         if !newer {
             guard.retain(|c| !(c.db == db && c.tz == tz && c.serial == serial));
             guard.push(SummaryCache {
