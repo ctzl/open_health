@@ -2251,13 +2251,17 @@ function showLoadError(msg) {
 
 let LOAD_SEQ = 0;
 // When the server serves a cached summary while rebuilding in the background it
-// sets `recomputing: true`. Poll a few times (the build takes ~1 min) so the
-// page swaps itself to fresh data without a manual refresh; capped so a broken
-// rebuild can't poll forever.
+// sets `recomputing: true`. Poll (the build takes ~1-2 min) so the page swaps
+// itself to fresh data without a manual refresh; capped per load so a broken
+// rebuild can't poll forever. The budget belongs to the load that started it:
+// a user-initiated load (Sync button, ring switch) always gets a fresh one —
+// a session-global counter was exhausted by earlier failed chains and then
+// every later sync silently stopped self-refreshing.
 let RECOMPUTE_POLL = null;
 let RECOMPUTE_TRIES = 0;
 let LAST_SUMMARY_RAW = null; // last rendered /api/summary body, to skip no-op re-renders
-async function load() {
+async function load(fromPoll = false) {
+  if (!fromPoll) RECOMPUTE_TRIES = 0; // new user-initiated load: fresh poll budget
   // guard against overlapping loads (sync/profile-save during an in-flight build):
   // a slower earlier response must not overwrite a newer one.
   const seq = ++LOAD_SEQ;
@@ -2278,10 +2282,10 @@ async function load() {
     // A recompute poll got back the exact same cached payload we already
     // rendered. Re-rendering would only flash the charts (HR chart included)
     // once per poll for the whole rebuild — keep waiting instead.
-    if (++RECOMPUTE_TRIES <= 12) {
+    if (++RECOMPUTE_TRIES <= 24) {
       clearTimeout(RECOMPUTE_POLL);
       RECOMPUTE_POLL = setTimeout(() => {
-        if (seq === LOAD_SEQ) load();
+        if (seq === LOAD_SEQ) load(true);
       }, 8000);
     }
     return;
@@ -2313,10 +2317,10 @@ async function load() {
     // now. Poll until fresh numbers land (or give up) instead of leaving the
     // page stale until the next manual refresh.
     if (RECOMPUTE_TRIES === 0) toast("Showing cached data — models are recomputing…", "info");
-    if (++RECOMPUTE_TRIES <= 12) {
+    if (++RECOMPUTE_TRIES <= 24) {
       clearTimeout(RECOMPUTE_POLL);
       RECOMPUTE_POLL = setTimeout(() => {
-        if (seq === LOAD_SEQ) load(); // stop if a newer load superseded this one
+        if (seq === LOAD_SEQ) load(true); // stop if a newer load superseded this one
       }, 8000);
     }
   } else {
