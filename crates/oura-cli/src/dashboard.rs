@@ -1138,7 +1138,30 @@ async fn handle(
     key_file: Option<PathBuf>,
 ) -> Result<()> {
     let mut buf = [0u8; 8192];
-    let n = sock.read(&mut buf).await?;
+    let mut n = 0usize;
+    // A single read can return a partial request — TCP segments arrive as they
+    // please, and a request line split across segments truncates the target:
+    // the query string (the ring serial) silently vanishes and /api/summary
+    // then claims no serial was passed. Read until the header block and any
+    // Content-Length body have fully arrived, the buffer is full, or EOF.
+    loop {
+        if let Some(sep) = buf[..n].windows(4).position(|w| w == [13, 10, 13, 10]) {
+            let head = String::from_utf8_lossy(&buf[..sep]).into_owned();
+            let want = header(&head, "content-length")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if n - (sep + 4) >= want {
+                break;
+            }
+        }
+        if n == buf.len() {
+            break;
+        }
+        match sock.read(&mut buf[n..]).await? {
+            0 => break,
+            k => n += k,
+        }
+    }
     let req = String::from_utf8_lossy(&buf[..n]);
     let method = req.split_whitespace().next().unwrap_or("GET");
     let target = req.split_whitespace().nth(1).unwrap_or("/");
