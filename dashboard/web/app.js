@@ -2286,6 +2286,7 @@ async function load() {
     }
     return;
   }
+  if (raw === LAST_SUMMARY_RAW) return; // identical payload — re-rendering would only flash the charts
   LAST_SUMMARY_RAW = raw;
   CURRENT_PROFILE = d.profile || null;
   CURRENT_TZ = d.tz || 0;
@@ -2323,6 +2324,19 @@ async function load() {
     RECOMPUTE_TRIES = 0; // fresh data landed (or nothing was recomputing)
   }
 }
+
+// The server syncs rings on its own schedule; an open page would otherwise sit
+// on its last fetch forever (the battery tile showing a stale % after a
+// background sync is the classic symptom). Re-validate periodically and when the
+// tab regains focus; the identical-payload guard in load() keeps this silent
+// unless something actually changed, and a changed payload carries
+// recomputing:true while the rebuild runs, which the poll loop below swaps in.
+setInterval(() => {
+  if (!document.hidden && !LIVE_ABORT) load();
+}, 5 * 60 * 1000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !LIVE_ABORT) load();
+});
 
 // ── ring switcher ─────────────────────────────────────────
 // The dashboard shows one ring at a time; every data fetch carries ?serial=.
