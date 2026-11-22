@@ -756,6 +756,23 @@ fn recompute_in_flight() -> &'static Mutex<std::collections::HashSet<String>> {
     S.get_or_init(Default::default)
 }
 
+/// Dbs with a BLE sync currently writing. Events land continuously during a
+/// sync, so a rebuild spawned mid-sync is invalidated by its own token recheck
+/// at completion (observed: a full model batch thrown away per sync).
+/// `cached_summary` defers spawning while a sync is in flight; `warm_summaries`
+/// triggers the one rebuild that matters at sync end, against final data.
+fn sync_writing() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn sync_in_flight(db: &Path) -> bool {
+    sync_writing()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(db)
+}
+
 fn store_summary(
     db: &Path,
     tz: f64,
@@ -841,7 +858,15 @@ fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value
             drop(guard);
             let spawned = {
                 let mut inflight = recompute_in_flight().lock().unwrap();
-                inflight.insert(key.clone()) // false if a rebuild is already running
+                if sync_in_flight(db) {
+                    // A sync is still draining events into the db: a rebuild now
+                    // would race the stream and its token recheck would discard
+                    // the result. Stay stale+recomputing; warm_summaries fires
+                    // the rebuild against final data when the sync ends.
+                    false
+                } else {
+                    inflight.insert(key.clone()) // false if a rebuild is already running
+                }
             };
             if spawned {
                 // RAII: clear the in-flight flag even if the build panics, so a
@@ -856,29 +881,72 @@ fn cached_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<(Arc<Value
                 std::thread::spawn(move || {
                     let _guard = InFlightGuard(key);
                     let started = std::time::Instant::now();
-                    let token_now = summary_token(&db2);
-                    match build_summary(&db2, tz2, Some(&serial2)) {
-                        Ok(v) => {
-                            let value = Arc::new(v);
-                            // if inputs changed again mid-build, skip caching: the next
-                            // request sees the mismatch and re-runs against new state
-                            if summary_token(&db2) == token_now {
-                                store_summary(&db2, tz2, &serial2, token_now, &value);
+                    // If inputs changed mid-build (a sync landed, a profile edit),
+                    // rebuild against the new state immediately instead of waiting
+                    // for the next client request to notice the mismatch — that
+                    // wait is what left the dashboard on stale data for minutes.
+                    // Bounded so a pathological writer can't spin the models
+                    // forever. Never retry over a still-running sync: the
+                    // post-sync warm_summaries kick is the one against final data.
+                    let mut attempt = 0;
+                    loop {
+                        attempt += 1;
+                        let token_now = summary_token(&db2);
+                        match build_summary(&db2, tz2, Some(&serial2)) {
+                            Ok(v) => {
+                                let value = Arc::new(v);
+                                if summary_token(&db2) == token_now {
+                                    store_summary(&db2, tz2, &serial2, token_now, &value);
+                                    log_activity(
+                                        "summary",
+                                        "ok",
+                                        &format!(
+                                            "background recompute finished in {} ms",
+                                            started.elapsed().as_millis()
+                                        ),
+                                    );
+                                    break;
+                                }
+                                if sync_in_flight(&db2) {
+                                    log_activity(
+                                        "summary",
+                                        "retry",
+                                        "inputs still changing (sync in progress); \
+                                         superseding this build, post-sync rebuild follows",
+                                    );
+                                    break;
+                                }
+                                if attempt >= 3 {
+                                    // Out of retries: cache this build anyway (it is
+                                    // still newer than what the client has); the token
+                                    // mismatch makes the next request rebuild again.
+                                    store_summary(&db2, tz2, &serial2, token_now, &value);
+                                    log_activity(
+                                        "summary",
+                                        "ok",
+                                        &format!(
+                                            "background recompute finished in {} ms \
+                                             (retry cap, inputs still moving)",
+                                            started.elapsed().as_millis()
+                                        ),
+                                    );
+                                    break;
+                                }
+                                log_activity(
+                                    "summary",
+                                    "retry",
+                                    "inputs changed mid-build; rebuilding against new state",
+                                );
                             }
-                            log_activity(
-                                "summary",
-                                "ok",
-                                &format!(
-                                    "background recompute finished in {} ms",
-                                    started.elapsed().as_millis()
-                                ),
-                            );
+                            Err(e) => {
+                                log_activity(
+                                    "summary",
+                                    "error",
+                                    &format!("background recompute failed: {e}"),
+                                );
+                                break;
+                            }
                         }
-                        Err(e) => log_activity(
-                            "summary",
-                            "error",
-                            &format!("background recompute failed: {e}"),
-                        ),
                     }
                 });
             }
@@ -1847,6 +1915,23 @@ fn warm_summaries(db: &Path) {
 /// ring that is right there. We use a longer scan window and retry the transient
 /// "no matching ring" miss a couple of times before giving up.
 fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Result<String> {
+    // Mark the db as mid-write for the whole transfer (all retries): summary
+    // rebuilds defer until it ends — one rebuild against final data (warm_summaries)
+    // instead of racing the event stream. RAII so a panic/unlock still clears it.
+    struct SyncGuard(PathBuf);
+    impl Drop for SyncGuard {
+        fn drop(&mut self) {
+            sync_writing()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.0);
+        }
+    }
+    let _sync = SyncGuard(db.to_path_buf());
+    sync_writing()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(db.to_path_buf());
     let exe = std::env::current_exe().context("locating oura binary")?;
     let target = if serial.is_empty() {
         format!("name={name}")
