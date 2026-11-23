@@ -43,3 +43,7 @@ nssa_cache.json
 # Python research/test bytecode
 __pycache__/
 apps/ios/OuraApp/project-model-validation.yml
+
+# Real-data golden vectors: personal health data, local-only (regenerate
+# with tools/gen_ibi_vectors.py). Synthetic vectors stay committed.
+crates/ibi-correct/tests/vectors/real_*.json

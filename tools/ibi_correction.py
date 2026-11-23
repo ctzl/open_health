@@ -641,11 +641,84 @@ class IbiCorrection:
                 return
 
 
-def correct_ibis(raw):
-    """raw: iterable of (timestamp_ms, ibi_ms, amplitude) in ring order.
-    Returns [(timestamp_ms, ibi, amplitude, validity)] exactly as the official app's
-    ecore.correctIbiAndAmplitudeEvents does (fresh state per call)."""
+def _correct_ibis_python(raw):
+    """Reference implementation of the dispatcher below (pure Python)."""
     c = IbiCorrection()
     for ts, ibi, amp in raw:
         c.run(int(ibi), int(amp), int(ts))
     return c.out
+
+
+# --- Rust fast path -----------------------------------------------------------
+# crates/ibi-correct is a bit-exact port of the class above, golden-tested
+# against this file over real + synthetic streams (crates/ibi-correct/tests/).
+# When the binary has been built, correct_ibis streams through a persistent
+# worker process; otherwise it falls back to the pure-Python reference.
+
+import atexit as _atexit
+import json as _json
+import os as _os
+import subprocess as _subprocess
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_CANDIDATES = [
+    _os.path.join(_HERE, "..", "target", "release", "ibi-correct.exe"),
+    _os.path.join(_HERE, "..", "target", "debug", "ibi-correct.exe"),
+    _os.path.join(_HERE, "..", "target", "release", "ibi-correct"),
+]
+_worker = None
+
+
+def _find_binary():
+    for path in _CANDIDATES:
+        if _os.path.exists(path):
+            return path
+    return None
+
+
+def _shutdown_worker():
+    global _worker
+    if _worker is not None and _worker.poll() is None:
+        try:
+            _worker.stdin.close()
+            _worker.wait(timeout=5)
+        except Exception:
+            _worker.kill()
+    _worker = None
+
+
+def _rust_worker():
+    global _worker
+    binary = _find_binary()
+    if binary is None:
+        return None
+    if _worker is None or _worker.poll() is not None:
+        _worker = _subprocess.Popen(
+            [binary, "--jsonl"], stdin=_subprocess.PIPE, stdout=_subprocess.PIPE,
+            encoding="ascii", bufsize=1)
+        _atexit.register(_shutdown_worker)
+    return _worker
+
+
+def correct_ibis(raw):
+    """raw: iterable of (timestamp_ms, ibi_ms, amplitude) in ring order.
+    Returns [(timestamp_ms, ibi, amplitude, validity)] exactly as the official app's
+    ecore.correctIbiAndAmplitudeEvents does (fresh state per call). Uses the Rust
+    port when its binary is built; identical output either way."""
+    worker = _rust_worker()
+    if worker is None:
+        return _correct_ibis_python(raw)
+    payload = _json.dumps([[int(t), int(b), int(a)] for t, b, a in raw])
+    try:
+        worker.stdin.write(payload + "\n")
+        worker.stdin.flush()
+        line = worker.stdout.readline()
+    except (OSError, ValueError):
+        return _correct_ibis_python(raw)
+    if not line:
+        _shutdown_worker()
+        return _correct_ibis_python(raw)
+    record = _json.loads(line)
+    if isinstance(record, dict):  # malformed-input marker from the CLI
+        raise RuntimeError(f"ibi-correct: {record.get('error')}")
+    return [(t, b, a, v) for t, b, a, v in record]

@@ -6,6 +6,7 @@ members = [
     "crates/oura-core",
     "crates/oura-summary",
     "crates/oura-dna",
+    "crates/ibi-correct",
 ]
 
 [workspace.package]
