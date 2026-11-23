@@ -605,7 +605,15 @@ type CacheToken = (
     Option<SystemTime>,
     Option<SystemTime>,
     i64,
+    u32,
 );
+
+/// Bump when `build_summary`'s output shape changes — new fields, new semantics,
+/// removed keys. The DB and sidecar inputs can be byte-identical across a binary
+/// update, so without this a rebuilt binary keeps serving the previous run's
+/// sidecar as "fresh" and the new fields never appear (breathing/perf added
+/// under v2).
+const SUMMARY_SHAPE_VERSION: u32 = 2;
 
 /// SQLite change signal for the DB, for derived-data cache keys.
 ///
@@ -654,6 +662,7 @@ fn summary_token(db: &Path) -> CacheToken {
         mtime(&feature_modes_path(db)),
         mtime(&bedtime_overrides_path(db)),
         oura_store::storage::DECODER_VERSION,
+        SUMMARY_SHAPE_VERSION,
     )
 }
 
@@ -684,12 +693,12 @@ fn token_to_json(t: &CacheToken) -> Value {
             vec![d.as_secs() as i64, d.subsec_nanos() as i64]
         })
     };
-    json!([t.0, mt(&t.1), mt(&t.2), mt(&t.3), t.4])
+    json!([t.0, mt(&t.1), mt(&t.2), mt(&t.3), t.4, t.5])
 }
 
 fn token_from_json(v: &Value) -> Option<CacheToken> {
     let a = v.as_array()?;
-    if a.len() != 5 {
+    if a.len() != 6 {
         return None;
     }
     let mt = |v: &Value| -> Option<Option<SystemTime>> {
@@ -708,6 +717,7 @@ fn token_from_json(v: &Value) -> Option<CacheToken> {
         mt(&a[2])?,
         mt(&a[3])?,
         a[4].as_i64()?,
+        a[5].as_u64()? as u32,
     ))
 }
 

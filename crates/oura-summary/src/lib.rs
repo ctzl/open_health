@@ -597,6 +597,8 @@ struct Night {
     spo2_t: Vec<(i64, f64)>,
     temp_t: Vec<(i64, f64)>,
     motion_t: Vec<(i64, f64)>,
+    /// Perfusion index samples (0..1 scale) from SpO2 events — peripheral perfusion.
+    perf_t: Vec<(i64, f64)>,
     /// Respiratory rate, breaths per minute, from the ring's own per-window estimate
     /// (`sleep_period_information_2.breath`) — only windows it scored as sleep, since
     /// an awake breath rate is not the biomarker. One of the four Symptom Radar inputs.
@@ -2478,6 +2480,16 @@ pub fn build_summary(
                     nights[idx].spo2_t.extend(pcts.iter().map(|&p| (*ds, p)));
                     nights[idx].spo2.extend(pcts);
                 }
+                // Perfusion index (same events, same sample count): peripheral
+                // blood-flow strength at the finger — vascular tone / warmth.
+                if let Some(a) = v["perfusion_index"].as_array() {
+                    let pis: Vec<f64> = a
+                        .iter()
+                        .filter_map(|x| x.as_f64())
+                        .filter(|&x| x > 0.0 && x < 10.0)
+                        .collect();
+                    nights[idx].perf_t.extend(pis.iter().map(|&p| (*ds, p)));
+                }
             }
             "motion_event" => {
                 // seconds of motion in this window — a restlessness signal aligned to
@@ -2663,7 +2675,13 @@ pub fn build_summary(
         let raw_mean_hrv = mean(&nt.rmssd);
         let night_rhr = raw_lowest_hr.map(|x| x.round());
         let night_hrv = raw_mean_hrv.map(|x| x.round());
-        let night_breath = median_of(&nt.breath);
+        let night_breath = median_of(&nt.breath).or_else(|| {
+            // The ring streams no 0x6a breath for these models; fall back to the
+            // RSA estimate the sleep tool derived from IBI (same units, br/min).
+            hyp.and_then(|h| h.get("breath"))
+                .and_then(|b| b.get("median"))
+                .and_then(|m| m.as_f64())
+        });
         let is_main_sleep = (nt.end_ds - nt.start_ds) >= sleep_score::MIN_BASELINE_SLEEP_DS;
         let rhr_baseline = if is_main_sleep {
             let priors: Vec<f64> = prior_main_rhr
@@ -2750,6 +2768,7 @@ pub fn build_summary(
                 "temp": timed(&nt.temp_t, 2),
                 "spo2": timed(&nt.spo2_t, 0),
                 "motion": timed(&nt.motion_t, 0),
+                "perf": timed(&nt.perf_t, 4),
             },
             "metrics": metrics,
             // mean HR/HRV per sleep stage (deep/light/rem) — deep-sleep HRV is the
@@ -2775,6 +2794,16 @@ pub fn build_summary(
         });
         night_json["stages_5min"] = json!(stages_5min);
         night_json["stages_t0_unix"] = json!(stages_t0_unix);
+        // SleepNet-BDI apnea epochs for this window (absent = the model couldn't
+        // run for every bedtime; never a partial night presented as a clean one).
+        if let Some(apnea) = hyp.and_then(|h| h.get("apnea")).filter(|a| !a.is_null()) {
+            night_json["apnea"] = json!(apnea);
+        }
+        // RSA respiratory-rate series per 60 s window (same derivation the Symptom
+        // Radar's nightly median uses) — the day view charts it as a lane.
+        if let Some(breath) = hyp.and_then(|h| h.get("breath")).filter(|b| !b.is_null()) {
+            night_json["breath"] = json!(breath);
+        }
         nights_json.push(night_json);
         if is_main_sleep {
             if let Some(lowest) = raw_lowest_hr {

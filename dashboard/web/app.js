@@ -263,6 +263,10 @@ function dayCard(d, ymd) {
     const comp = el("div", "breakdown");
     const seg = (l, v) => `<span>${l} <b>${num(v)}%</b></span>`;
     comp.innerHTML = seg("Deep", n.deep_pct) + seg("Light", n.light_pct) + seg("REM", n.rem_pct) + seg("Awake", n.wake_pct);
+    // BDI ran for this night: show the count here, the timeline on the sleep page.
+    if (n.apnea) comp.innerHTML += `<span>Apnea <b>${n.apnea.flagged_epochs}</b></span>`;
+    // RSA respiratory rate median for the night (same source as the day-view lane).
+    if (n.breath) comp.innerHTML += `<span>Breath <b>${n.breath.median}</b></span>`;
     sp.append(comp);
     sp.addEventListener("click", () => openDayPage(d, ymd, "sleep"));
     card.append(sp);
@@ -909,6 +913,20 @@ function hypnoSvg(stages, w, h, span = [0, 1]) {
   return `<svg class="lane-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}${conn}${runs}</svg>`;
 }
 
+// SleepNet-BDI apnea epochs as ticks on the shared night axis: one tick per
+// flagged 30 s epoch, opacity scaled by the model's score. The official app only
+// surfaces this with BDI enabled; here it renders whenever the model ran.
+function apneaSvg(events, w, h, axis) {
+  const ticks = events.map(([ms, score]) => {
+    const f = axis.frac(ms / 1000);
+    if (f < 0 || f > 1) return "";
+    const op = (0.4 + 0.6 * Math.min(1, Math.max(0, score))).toFixed(2);
+    return `<line x1="${(f * w).toFixed(1)}" x2="${(f * w).toFixed(1)}" y1="3" y2="${h - 3}" stroke="var(--warn)" stroke-width="2" opacity="${op}" vector-effect="non-scaling-stroke"/>`;
+  }).join("");
+  return `<svg class="lane-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">` +
+    `<line x1="0" y1="${h - 1.5}" x2="${w}" y2="${h - 1.5}" stroke="var(--line-soft)" stroke-width="0.5"/>${ticks}</svg>`;
+}
+
 // smooth auto-scaled line + faint area + dashed mean, for one signal lane
 function laneSvg(v, w, h, color, span = [0, 1], times = null) {
   if (times && times.length === v.length && v.length) {
@@ -1154,6 +1172,28 @@ function sleepSection(d, ymd, axis, cursor) {
       },
     });
   }
+  if (n.apnea && Array.isArray(n.apnea.events)) {
+    const ev = n.apnea.events;
+    rows.push({
+      label: "Apnea · BDI", summary: `${ev.length} events · ${ev.length * 0.5} min`,
+      height: 50, html: apneaSvg(ev, W, 50, axis),
+      valueAt: (t) => {
+        const hit = ev.find(([ms]) => Math.abs(t - ms / 1000) < 30);
+        return hit ? `apnea · score ${hit[1].toFixed(2)}` : "—";
+      },
+    });
+  }
+  // RSA respiratory rate (60 s windows, 30 s hop) derived from the same IBI
+  // stream the stager uses — gaps are windows with no clear spectral peak.
+  if (n.breath && Array.isArray(n.breath.series) && n.breath.series.length) {
+    const pts = n.breath.series;
+    const L = timedLaneSvg(pts, axis, W, 50, "var(--deep)");
+    if (L) rows.push({
+      label: "Breathing · RSA", summary: `${n.breath.median} br/min median`,
+      height: 50, html: L.svg,
+      valueAt: (t) => { const p = nearestPoint(pts, t, 45); return p ? `${p[1].toFixed(1)} br/min` : "—"; },
+    });
+  }
   const timed = n.series_t; // real times; the flat `series` is only spread evenly
   const addLane = (key, label, unit, color, dp = 0, span = [0, 1]) => {
     if (timed) {
@@ -1194,6 +1234,7 @@ function sleepSection(d, ymd, axis, cursor) {
   addLane("hr", "Heart rate", "bpm", "var(--warn)");
   addLane("hrv", "HRV", "ms", "var(--accent)");
   addLane("spo2", "Blood O₂", "%", "var(--rem)");
+  addLane("perf", "Perfusion", "PI", "var(--wake)", 3);
   addLane("temp", "Skin temp", "°C", "var(--light)", 1, s.temp_span || [0, 1]);
   addLane("motion", "Motion", "s", "var(--faint)");
   if (rows.length) sec.append(el("p", "subhead", "Overnight"), tlBox(axis, cursor, rows));

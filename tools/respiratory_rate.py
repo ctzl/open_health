@@ -93,3 +93,28 @@ def respiratory_rate(ts_s: np.ndarray, ibi_ms: np.ndarray):
         return float("nan"), float("nan"), len(rr)
     rr = np.array(rr)
     return float(np.median(rr)), float(np.std(rr)), len(rr)
+
+
+def respiratory_series(ts_s: np.ndarray, ibi_ms: np.ndarray):
+    """Per-window respiratory rate: [[window_start_unix_s, br/min], ...].
+
+    Same pipeline as `respiratory_rate`, but keeps each window's estimate and its
+    start time so the dashboard can chart breathing across the night. Windows with
+    no clear spectral peak are dropped (gaps in the series = no reliable estimate,
+    not a breath-rate value). A 5-window median filter removes single-window
+    jumps; values outside the physiological band are dropped."""
+    grid, x = _tachogram(np.asarray(ts_s, float), np.asarray(ibi_ms, float))
+    if grid is None:
+        return []
+    x = _bandpass(x)
+    win, step = int(WIN_S * FS), int(STEP_S * FS)
+    rr = []
+    for i in range(0, len(x) - win + 1, step):
+        f = _dominant_freq(x[i : i + win])
+        if f is not None and 6.0 <= f * 60.0 <= 35.0:
+            rr.append([int(grid[i]), round(f * 60.0, 1)])
+    if len(rr) < 3:
+        return []
+    vals = [v for _, v in rr]
+    med = lambda a: sorted(a)[len(a) // 2]
+    return [[t, round(med(vals[max(0, i - 2):i + 3]), 1)] for i, (t, _) in enumerate(rr)]

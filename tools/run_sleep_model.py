@@ -29,8 +29,9 @@ from ibi_correction import correct_ibis
 REPO = Path(__file__).resolve().parent.parent
 TZ = 1.0
 STAGE = {1: "DEEP", 2: "LIGHT", 3: "REM", 4: "WAKE"}
-CACHE_VERSION = "nssa-2.6.0-r1"
+CACHE_VERSION = "nssa-2.6.0-r2"  # r2: cache entries also carry BDI apnea epochs
 EPOCH_MS = 30000
+BDI_MODEL = "sleepnet_bdi_0_4_0.pt"
 
 JSON = "--json" in sys.argv
 BATCH = "--batch" in sys.argv
@@ -125,6 +126,42 @@ def stager():
     return _stager
 
 
+_bdi = None
+
+
+def bdi_model():
+    """SleepNet-BDI: Oura's breathing-disturbance model. Same IBI stream the
+    stager consumes; emits per-30s apnea flags (app: SleepNetBdiPyTorchV04Model,
+    the source of the official app's Sleep breathing stability)."""
+    global _bdi
+    if _bdi is None:
+        import torch
+        _bdi = torch.jit.load(
+            str(resolve_models_dir(REPO, BDI_MODEL) / BDI_MODEL), map_location="cpu").eval()
+    return _bdi
+
+
+def apnea_epochs(inputs):
+    """BDI apnea epochs for one bedtime's inputs: [[epoch_start_ms, score], ...]
+    (score > 0.5, app threshold), or None when the model can't run (missing file,
+    bad window) — staging must not depend on it."""
+    try:
+        import torch
+        ibi = inputs["ibi"]
+        if not ibi:
+            return None
+        bedtime = torch.tensor(list(inputs["bedtime"]), dtype=torch.long)
+        ibi_val = torch.tensor([[b[1], b[2], b[3]] for b in ibi], dtype=torch.float32)
+        ibi_ts = torch.tensor([int(b[0]) for b in ibi], dtype=torch.long)
+        with torch.no_grad():
+            _ts, _stages, apnea, _out, _dbg = bdi_model()(bedtime, ibi_val, ibi_ts)
+        return [[int(t), round(float(s), 3)]
+                for t, s in zip(_ts.reshape(-1).tolist(), apnea[:, 0].tolist())
+                if float(s) > 0.5]
+    except Exception:
+        return None
+
+
 def cache():
     global _cache
     if _cache is None:
@@ -144,20 +181,41 @@ def save_cache():
         pass
 
 
+def breath_series(inputs):
+    """Per-window respiratory rate (RSA) from the same corrected IBI stream the
+    stager consumes. Cheap numpy work, deliberately computed OUTSIDE the model
+    cache so it never invalidates staged epochs. [] when nothing usable."""
+    try:
+        from respiratory_rate import respiratory_series
+        beats = inputs["ibi"]
+        if len(beats) < 60:
+            return []
+        return respiratory_series([b[0] / 1000.0 for b in beats], [b[1] for b in beats])
+    except Exception:
+        return []
+
+
 def stage_bedtime(b_start, b_end, cu, demo):
-    """NSSA epochs for one ring bedtime: (epoch start ms list, codes) or None."""
+    """NSSA epochs for one ring bedtime: (epoch start ms list, codes, apnea
+    events-or-None, breath series) or None when the night can't be staged."""
     inputs = collect_nssa_inputs(decoded_rows(), b_start, b_end, cu, ms, correct_ibis)
+    breath = breath_series(inputs)
     key = hashlib.sha256(json.dumps([CACHE_VERSION, SERIAL, demo, inputs], sort_keys=True).encode()).hexdigest()
     hit = cache()["nights"].get(key)
     if hit is not None:
-        return (hit["t"], hit["s"]) if hit else None
+        return (hit["t"], hit["s"], hit.get("a"), breath) if hit else None
     try:
         ts, codes = stager().stage(inputs, demo)
     except (ValueError, RuntimeError):
         ts, codes = None, None
-    cache()["nights"][key] = {"t": ts, "s": codes} if ts else {}
+    if not ts:
+        cache()["nights"][key] = {}
+        save_cache()
+        return None
+    apnea = apnea_epochs(inputs)  # never fails the stage; None = model unavailable
+    cache()["nights"][key] = {"t": ts, "s": codes, "a": apnea}
     save_cache()
-    return (ts, codes) if ts else None
+    return ts, codes, apnea, breath
 
 
 def grid_stages(periods, failed, start_ms, end_ms):
@@ -198,10 +256,18 @@ def score_window(start_ds, end_ds, captured_unix=None):
     if not beds:  # no ring bedtime (signal-derived night): stage the summary window
         beds, bedtime_source = [(start_ds, end_ds, bed_cu)], "summary"
     periods, failed = [], []
+    apnea_events, apnea_partial = [], False
+    breath_windows = []
     for b_start, b_end, cu in beds:
         staged = stage_bedtime(b_start, b_end, bed_cu, demo)
         if staged:
-            periods.append(staged)
+            ts, codes, apnea, breath = staged
+            periods.append((ts, codes))
+            breath_windows.extend(breath)
+            if apnea is None:
+                apnea_partial = True  # BDI unavailable for this bedtime
+            else:
+                apnea_events.extend(apnea)
         else:
             failed.append((ms(b_start, bed_cu), ms(b_end, bed_cu)))
     if not periods:
@@ -225,6 +291,21 @@ def score_window(start_ds, end_ds, captured_unix=None):
         "stages_t0_unix": main[0][0] / 1000.0,
         # Oura's own epochs per ring bedtime: start ms of epoch 0 and the codes.
         "nssa_periods": [{"t0_ms": ts[0], "stages": codes} for ts, codes in periods],
+        # SleepNet-BDI apnea epochs (30 s grid, app's >0.5 threshold). null when
+        # BDI couldn't run for every bedtime of this night (never a partial lie).
+        "apnea": None if apnea_partial else {
+            "events": sorted(apnea_events),
+            "flagged_epochs": len(apnea_events),
+            "flagged_min": round(len(apnea_events) * 0.5, 1),
+        },
+        # Respiratory rate per 60 s window (RSA from IBI; 30 s hop): [[unix_s,
+        # br/min], ...]. Gaps mean no clear spectral peak, not apnea. Absent
+        # entirely when the night has too few usable beats.
+        "breath": (lambda s: {
+            "series": sorted(s),
+            "median": round(sorted(v for _, v in s)[len(s) // 2], 1),
+            "windows": len(s),
+        })(breath_windows) if len(breath_windows) >= 10 else None,
         "demographics": demo,
     }
     for c, k in STAGE.items():
