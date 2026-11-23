@@ -1175,11 +1175,11 @@ function sleepSection(d, ymd, axis, cursor) {
   if (n.apnea && Array.isArray(n.apnea.events)) {
     const ev = n.apnea.events;
     rows.push({
-      label: "Apnea · BDI", summary: `${ev.length} events · ${ev.length * 0.5} min`,
+      label: "Apnea · BDI", summary: `${ev.length} events`,
       height: 50, html: apneaSvg(ev, W, 50, axis),
       valueAt: (t) => {
         const hit = ev.find(([ms]) => Math.abs(t - ms / 1000) < 30);
-        return hit ? `apnea · score ${hit[1].toFixed(2)}` : "—";
+        return hit ? `score ${hit[1].toFixed(2)}` : "—";
       },
     });
   }
@@ -1189,7 +1189,7 @@ function sleepSection(d, ymd, axis, cursor) {
     const pts = n.breath.series;
     const L = timedLaneSvg(pts, axis, W, 50, "var(--deep)");
     if (L) rows.push({
-      label: "Breathing · RSA", summary: `${n.breath.median} br/min median`,
+      label: "Breathing · RSA", summary: `${n.breath.median} br/min`,
       height: 50, html: L.svg,
       valueAt: (t) => { const p = nearestPoint(pts, t, 45); return p ? `${p[1].toFixed(1)} br/min` : "—"; },
     });

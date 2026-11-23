@@ -485,7 +485,7 @@ body.page-open { overflow: hidden; }
 
 /* ── day page timelines: every chart on one axis, one shared cursor ─────── */
 .tl {
-  --gut: 92px; --rgut: 30px;
+  --gut: 104px; --rgut: 30px;
   position: relative; background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 10px 16px 6px; box-shadow: var(--sheen), var(--shadow);
 }
@@ -527,7 +527,7 @@ body.page-open { overflow: hidden; }
   font-family: var(--mono); font-size: 10px; color: var(--faint);
 }
 @media (max-width: 560px) {
-  .tl { --gut: 66px; --rgut: 26px; padding: 8px 10px 4px; }
+  .tl { --gut: 84px; --rgut: 26px; padding: 8px 10px 4px; }
   .tl-gut { padding-right: 8px; }
   .tl-val { font-size: 12px; }
 }
