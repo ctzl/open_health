@@ -1107,13 +1107,82 @@ pub async fn serve(
     } else {
         println!("open_oura dashboard running — open http://127.0.0.1:{port} in your browser");
     }
-    loop {
-        let (sock, _) = listener.accept().await?;
-        let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
-        tokio::spawn(async move {
-            let _ = handle(sock, port, lan, db, tz, name, key_file).await;
-        });
+    // The start entry carries the pid and the binary's link time so a log read
+    // can tell which build served the entries below it — the failure mode this
+    // exists for is a restart that silently kept the OLD binary serving (the
+    // old exe holds the port, the new build never starts, and the log otherwise
+    // shows old behavior with no marker saying why).
+    log_activity(
+        "app",
+        "start",
+        &format!(
+            "dashboard starting (pid {}, built {}, port {port}, lan {lan}, tz {tz}, db {})",
+            std::process::id(),
+            exe_built_utc(),
+            db.display(),
+        ),
+    );
+    // Ctrl+C gets an end entry before the process goes. A hard kill
+    // (taskkill /F, Stop-Process) can log nothing — a start with no matching
+    // end is how those read in the log.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            log_activity(
+                "app",
+                "end",
+                &format!("dashboard stopping (pid {}, Ctrl+C)", std::process::id()),
+            );
+            std::process::exit(0);
+        }
+    });
+    let res: Result<()> = async {
+        loop {
+            let (sock, _) = listener.accept().await?;
+            let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
+            tokio::spawn(async move {
+                let _ = handle(sock, port, lan, db, tz, name, key_file).await;
+            });
+        }
     }
+    .await;
+    log_activity(
+        "app",
+        "end",
+        &format!(
+            "dashboard stopped (pid {}, {})",
+            std::process::id(),
+            match &res {
+                Ok(()) => "listener closed".to_string(),
+                Err(e) => format!("error: {e}"),
+            }
+        ),
+    );
+    res
+}
+
+/// When the running binary was linked, as UTC text ("2026-11-22T18:04:12Z").
+fn exe_built_utc() -> String {
+    let secs = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // civil_from_days (Howard Hinnant's algorithm) — no date crate in this crate
+    let days = (secs / 86_400) as i64;
+    let (h, m, s) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y0 = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y0 + 1 } else { y0 };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// Serve a web asset: prefer the on-disk file under `dashboard/web/` (so the UI
