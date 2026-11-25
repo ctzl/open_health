@@ -25,6 +25,7 @@ hex = "0.4"
 serde_json = "1"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+nssa-plumbing = { path = "../nssa-plumbing" }
 sha2 = "0.10"
 # Outbound HTTPS is used ONLY to fetch PUBLIC PGS Catalog score *definitions* from
 # EBI on explicit user action (see dna.rs); no genome/personal data is ever sent.

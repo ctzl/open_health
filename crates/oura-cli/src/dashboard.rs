@@ -451,7 +451,6 @@ fn run_py_json_stdin_optional(
 /// for (the in-process entry points take the exact same argv as the scripts).
 struct ModelArgv {
     sleep: Vec<String>,
-    sleep_stdin: Vec<u8>,
     cva: Vec<String>,
     activity: Vec<String>,
     illness: Vec<String>,
@@ -462,10 +461,8 @@ fn model_argv(
     db: &Path,
     tz: f64,
     demo: &Demographics,
-    sleep_ranges: &[[i64; 3]],
     serial: &str,
 ) -> ModelArgv {
-    let sleep_stdin = serde_json::to_vec(sleep_ranges).unwrap_or_default();
     let sleep = vec![
         db.display().to_string(),
         tz.to_string(),
@@ -500,7 +497,7 @@ fn model_argv(
     ];
     let illness = vec![db.display().to_string(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
     let stress = vec![db.display().to_string(), "--tz".into(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
-    ModelArgv { sleep, sleep_stdin, cva, activity, illness, stress }
+    ModelArgv { sleep, cva, activity, illness, stress }
 }
 
 /// The signal-estimator top-up both runners share: a missing or partial sleep
@@ -526,6 +523,143 @@ fn finish_sleep(
 /// exactly as before, and falls back to Rust signal-based sleep staging when the
 /// Python environment or private `.pt` model file is unavailable on a user's PC.
 struct PythonRunner;
+/// The event rows the sleep plumbing needs, in `run_sleep_model.load_rows`'s
+/// exact order and filter — the cache fingerprint is only reproducible when the
+/// row set matches Python's. Also returns the raw (ds, tag, json, cu) tuples
+/// `build_epochs` consumes for the clock. `None` = DB unreadable.
+fn load_nssa_rows(
+    db: &Path,
+    serial: &str,
+) -> Option<(Vec<nssa_plumbing::rows::EventRow>, Vec<(i64, u8, Option<String>, i64)>)> {
+    use nssa_plumbing::rows::EventRow;
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT ring_timestamp, tag, COALESCE(decoded_json, '{}'), captured_unix, body \
+             FROM events \
+             WHERE (decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14)) \
+               AND serial = ?1 ORDER BY captured_unix, id",
+        )
+        .ok()?;
+    let mut rows = Vec::new();
+    let mut clock_rows = Vec::new();
+    let mut q = stmt
+        .query_map(rusqlite::params![serial], |r| {
+            let ds: i64 = r.get(0)?;
+            let tag: i64 = r.get(1)?;
+            let js: String = r.get(2)?;
+            let cu: i64 = r.get(3)?;
+            let body: Option<Vec<u8>> = r.get(4)?;
+            Ok((ds, tag as u8, js, cu, body))
+        })
+        .ok()?;
+    while let Some((ds, tag, js, cu, body)) = q.next().and_then(|v| v.ok()) {
+        clock_rows.push((ds, tag, Some(js.clone()), cu));
+        let mut row = EventRow {
+            ds,
+            tag,
+            cu,
+            ..Default::default()
+        };
+        let payload: Value = serde_json::from_str(&js).unwrap_or_default();
+        match tag {
+            nssa_plumbing::rows::TAG_IBI => {
+                let ibi: Vec<i64> = payload
+                    .get("ibi_ms")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+                if ibi.len() == 6 {
+                    row.ibi_ms = Some([ibi[0], ibi[1], ibi[2], ibi[3], ibi[4], ibi[5]]);
+                }
+                row.amplitude = payload
+                    .get("amplitude")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .or(Some(Vec::new()));
+            }
+            nssa_plumbing::rows::TAG_BEDTIME => {
+                row.bedtime_start_ds = payload.get("bedtime_start_ds").and_then(|v| v.as_i64());
+                row.bedtime_end_ds = payload.get("bedtime_end_ds").and_then(|v| v.as_i64());
+            }
+            nssa_plumbing::rows::TAG_ACM | nssa_plumbing::rows::TAG_TEMP => row.body = body,
+            _ => {}
+        }
+        rows.push(row);
+    }
+    Some((rows, clock_rows))
+}
+
+/// T2c: answer sleep windows from `nssa_cache.json` in-process; only windows the
+/// cache cannot answer are delegated to the Python model (which fills the cache
+/// for the next recompute). The cold torch spawn — seconds per rebuild — is gone
+/// from warm recomputes. `None` = the batch failed outright, exactly as
+/// `run_py_json_stdin` would report it.
+fn sleep_batch_cached(
+    root: &Path,
+    py: &Path,
+    db: &Path,
+    tz: f64,
+    demo: &Demographics,
+    sleep_ranges: &[[i64; 3]],
+    serial: &str,
+    argv: &ModelArgv,
+) -> Option<Value> {
+    use nssa_plumbing::cache::{self, Served};
+    use nssa_plumbing::clock::{build_epochs, Clock};
+    use nssa_plumbing::grid::demographics;
+    let run_python = |ranges: &[&[i64; 3]]| -> Option<Value> {
+        let stdin = serde_json::to_vec(&ranges.iter().map(|r| *r).collect::<Vec<_>>()).ok()?;
+        run_py_json_stdin(root, py, "tools/run_sleep_model.py", &argv.sleep, &stdin)
+    };
+    if sleep_ranges.is_empty() {
+        return Some(Value::Array(Vec::new()));
+    }
+    let (rows, clock_rows) = match load_nssa_rows(db, serial) {
+        Some(v) => v,
+        None => return run_python(&sleep_ranges.iter().collect::<Vec<_>>()),
+    };
+    let ncache = match cache::Cache::load(db, Some(serial)) {
+        Some(c) => c,
+        None => return run_python(&sleep_ranges.iter().collect::<Vec<_>>()),
+    };
+    let clock_refs: Vec<(i64, u8, Option<&str>, i64)> = clock_rows
+        .iter()
+        .map(|(ds, tag, js, cu)| (*ds, *tag, js.as_deref(), *cu))
+        .collect();
+    let clock = Clock::new(build_epochs(&clock_refs));
+    let demo3 = demographics(demo.age, demo.height_m, demo.weight_kg, &demo.sex.to_string());
+    let mut slots: Vec<Value> = Vec::with_capacity(sleep_ranges.len());
+    let mut missed: Vec<(usize, [i64; 3])> = Vec::new();
+    for &[s, e, cu] in sleep_ranges {
+        match cache::serve_window(&clock, &rows, &ncache, s, e, Some(cu), tz, &demo3) {
+            Served::Ok(v) => slots.push(v),
+            // Python's batch prints null for a window error too — same slot.
+            Served::Err(_) => slots.push(Value::Null),
+            Served::Missed => {
+                slots.push(Value::Null);
+                missed.push((slots.len() - 1, [s, e, cu]));
+            }
+        }
+    }
+    if !missed.is_empty() {
+        let refs: Vec<&[i64; 3]> = missed.iter().map(|(_, r)| r).collect();
+        let out = run_python(&refs)?;
+        let arr = out.as_array()?.clone();
+        if arr.len() != missed.len() {
+            return None;
+        }
+        for ((idx, _), v) in missed.iter().zip(arr) {
+            slots[*idx] = v;
+        }
+    }
+    Some(Value::Array(slots))
+}
+
 impl ModelRunner for PythonRunner {
     fn run(&self, input: ModelInputs) -> ModelOutputs {
         let ModelInputs {
@@ -537,12 +671,14 @@ impl ModelRunner for PythonRunner {
         } = input;
         let root = repo_root();
         let py = root.as_deref().map(python_bin);
-        let argv = model_argv(db, tz, demo, sleep_ranges, serial);
+        let argv = model_argv(db, tz, demo, serial);
 
         let (sleep_batch, cva, activity, illness, stress) = match (root.as_deref(), py.as_deref()) {
             (Some(r), Some(p)) => std::thread::scope(|s| {
                 let sh = s.spawn(|| {
-                    run_py_json_stdin(r, p, "tools/run_sleep_model.py", &argv.sleep, &argv.sleep_stdin)
+                    // T2c: serve from nssa_cache.json in-process; Python only
+                    // runs for windows the cache cannot answer.
+                    sleep_batch_cached(r, p, db, tz, demo, sleep_ranges, serial, &argv)
                 });
                 let ch = s.spawn(|| run_py_json(r, p, "tools/run_cva_model.py", &argv.cva));
                 let ah = s.spawn(|| run_py_json(r, p, "tools/run_activity_model.py", &argv.activity));
@@ -594,7 +730,7 @@ impl ModelRunner for RustRunner {
         } = input;
         let root = repo_root();
         let py = root.as_deref().map(python_bin);
-        let argv = model_argv(db, tz, demo, sleep_ranges, serial);
+        let argv = model_argv(db, tz, demo, serial);
         // oura-models resolves its .pt files from its own manifest, but
         // activity's repo_root() reads OURA_REPO (then cwd) — pin it to the
         // checkout the dashboard is running from.
@@ -605,7 +741,9 @@ impl ModelRunner for RustRunner {
         let (sleep_batch, cva, activity, illness, stress) = match (root.as_deref(), py.as_deref()) {
             (Some(r), Some(p)) => std::thread::scope(|s| {
                 let sh = s.spawn(|| {
-                    run_py_json_stdin(r, p, "tools/run_sleep_model.py", &argv.sleep, &argv.sleep_stdin)
+                    // T2c: serve from nssa_cache.json in-process; Python only
+                    // runs for windows the cache cannot answer.
+                    sleep_batch_cached(r, p, db, tz, demo, sleep_ranges, serial, &argv)
                 });
                 let ch = s.spawn(|| {
                     run_rust_model("cva", "tools/run_cva_model.py", r, p, &argv.cva, || {
@@ -2695,6 +2833,67 @@ mod tests {
         assert_eq!(
             parse_beat_line("No beats captured. Make sure the ring is worn."),
             None
+        );
+    }
+
+    // T2c debug probe (run with --ignored --nocapture): recompute the cache
+    // fingerprint for one real bedtime and dump the text for diffing against
+    // the Python probe. Personal inputs come from the environment so nothing
+    // personal lives in this file; the probe skips when they are absent:
+    //   PROBE_DB, PROBE_SERIAL, PROBE_AGE, PROBE_HEIGHT, PROBE_WEIGHT,
+    //   PROBE_SEX, PROBE_START, PROBE_END, PROBE_REF, PROBE_OUT
+    #[test]
+    #[ignore]
+    fn probe_nssa_fingerprint() {
+        use nssa_plumbing::cache;
+        use nssa_plumbing::clock::{build_epochs, Clock};
+        use nssa_plumbing::grid::demographics;
+        use nssa_plumbing::inputs::collect_nssa_inputs;
+        let env = |k: &str| std::env::var(k).ok();
+        let (Some(db), Some(serial)) = (env("PROBE_DB"), env("PROBE_SERIAL")) else {
+            eprintln!("skip: set PROBE_DB + PROBE_SERIAL to run this probe");
+            return;
+        };
+        let (age, height, weight, sex) = match (
+            env("PROBE_AGE").and_then(|v| v.parse().ok()),
+            env("PROBE_HEIGHT").and_then(|v| v.parse().ok()),
+            env("PROBE_WEIGHT").and_then(|v| v.parse().ok()),
+            env("PROBE_SEX"),
+        ) {
+            (Some(a), Some(h), Some(w), Some(s)) => (a, h, w, s),
+            _ => {
+                eprintln!("skip: PROBE_AGE/HEIGHT/WEIGHT/SEX missing");
+                return;
+            }
+        };
+        let win = ["PROBE_START", "PROBE_END", "PROBE_REF"].map(|k| {
+            env(k).and_then(|v| v.parse::<i64>().ok())
+        });
+        let [Some(start), Some(end), Some(reference)] = win else {
+            eprintln!("skip: PROBE_START/END/REF missing");
+            return;
+        };
+        let db = std::path::Path::new(&db);
+        let (rows, clock_rows) = load_nssa_rows(db, &serial).expect("rows");
+        let clock_refs: Vec<(i64, u8, Option<&str>, i64)> = clock_rows
+            .iter()
+            .map(|(ds, tag, js, cu)| (*ds, *tag, js.as_deref(), *cu))
+            .collect();
+        let clock = Clock::new(build_epochs(&clock_refs));
+        let demo3 = demographics(age, height, weight, &sex);
+        let inputs = collect_nssa_inputs(&rows, start, end, reference, &clock);
+        let text = cache::fingerprint_text(Some(&serial), &demo3, &inputs);
+        if let Some(out) = env("PROBE_OUT") {
+            std::fs::write(out, &text).unwrap();
+        }
+        let key = cache::fingerprint(Some(&serial), &demo3, &inputs);
+        let nc = cache::Cache::load(db, Some(&serial)).expect("cache");
+        println!("rs key: {key} in cache: {}", nc.has_night(&key));
+        println!(
+            "rs inputs: acm {} ibi {} temp {}",
+            inputs.acm.len(),
+            inputs.ibi.len(),
+            inputs.temp.len()
         );
     }
 }

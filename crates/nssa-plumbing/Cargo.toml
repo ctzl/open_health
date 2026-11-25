@@ -18,3 +18,4 @@ serde = { version = "1", features = ["derive"] }
 # 0x3fb7171720000000) — enough to break a bit-exact golden comparison.
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 ibi-correct = { path = "../ibi-correct" }
+sha2 = "0.10"  # the night-cache key is sha256, same as Python's hashlib

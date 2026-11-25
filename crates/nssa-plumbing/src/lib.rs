@@ -9,7 +9,9 @@
 //! * `tools/respiratory_rate.respiratory_series` + `run_sleep_model.breath_series`
 //!   — respiratory rate from the corrected IBI stream ([`breath`]);
 //! * `run_sleep_model.grid_stages` + the non-model half of `score_window` —
-//!   hypnogram onto the 30 s grid and the summary arithmetic ([`grid`]).
+//!   hypnogram onto the 30 s grid and the summary arithmetic ([`grid`]);
+//! * `run_sleep_model.stage_bedtime`'s cache key + `nssa_cache.json` — serving
+//!   staged nights without starting torch ([`cache`]).
 //!
 //! IBI correction is NOT re-ported: [`inputs::collect_nssa_inputs`] calls
 //! `ibi_correct::correct_ibis` (crates/ibi-correct), the same code the Python shim
@@ -32,6 +34,7 @@
 
 pub mod bedtimes;
 pub mod breath;
+pub mod cache;
 pub mod clock;
 pub mod grid;
 pub mod inputs;
