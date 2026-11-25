@@ -16,6 +16,7 @@ oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-summary = { path = "../oura-summary" }
 oura-dna = { path = "../oura-dna" }
+oura-models = { path = "../oura-models", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
@@ -32,7 +33,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 getrandom = "0.3"
-tch = { version = "=0.22.0", optional = true } # pinned to libtorch 2.9.0 (repo venv)
+tch = { version = "=0.26.0", optional = true } # targets libtorch 2.13 = the venv's torch (kept in lockstep). Keep in sync with crates/oura-models (same links key).
 
 [features]
 # Run the activity model in-process via LibTorch instead of shelling out to
@@ -42,4 +43,7 @@ tch = { version = "=0.22.0", optional = true } # pinned to libtorch 2.9.0 (repo 
 # bakes the rpath, so no DYLD_LIBRARY_PATH at runtime:
 #   export PATH="$PWD/.venv/bin:$PATH" LIBTORCH_USE_PYTORCH=1
 #   cargo run --features torch -- sessions --tz-offset 1
-torch = ["dep:tch"]
+# The same feature also enables the dashboard's RustRunner (in-process
+# cva/activity/illness/stress via the oura-models crate, Python fallback per
+# model on any error).
+torch = ["dep:tch", "dep:oura-models", "oura-models/torch"]

@@ -7,6 +7,8 @@ members = [
     "crates/oura-summary",
     "crates/oura-dna",
     "crates/ibi-correct",
+    "crates/nssa-plumbing",
+    "crates/oura-models",
 ]
 
 [workspace.package]
@@ -26,3 +28,10 @@ oura-store = { path = "vendor/oura-store" }
 # switch these back to { path = "../open_oura/crates/..." }.
 oura-protocol = { git = "https://github.com/ctzl/open_oura", rev = "ef001961506eb973500b462214af8a574712cd89" }
 oura-link = { git = "https://github.com/ctzl/open_oura", rev = "ef001961506eb973500b462214af8a574712cd89" }
+
+[patch.crates-io]
+# Vendored torch-sys 0.26.0: libtch typedef `module` renamed to `tch_module`
+# because MSVC C++20 (required by torch >=2.10 headers) reserves `module` as a
+# contextual keyword. Build needs CXXFLAGS="/std:c++20" (see .cargo/config.toml)
+# and the repo venv on PATH (torch 2.13.0+cpu, matches tch =0.26.0).
+torch-sys = { path = "vendor/torch-sys" }

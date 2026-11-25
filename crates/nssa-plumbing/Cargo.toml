@@ -1,0 +1,20 @@
+[package]
+name = "nssa-plumbing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no torch here: the plumbing is the part that must stay cheap and
+# dependency-free. The stager/BDI models stay on the Python side (see
+# docs/python-to-rust-plan.md Task 2); this crate only produces their inputs and
+# consumes their outputs.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# `arbitrary_precision` is not about big numbers: it makes serde keep the literal
+# text and convert with the std parser, which is correctly rounded. serde_json's
+# default fast float path is 1 ULP off on some values (e.g. it parses
+# "0.09019608050584793" to 0x3fb717171fffffff, Python and Rust std to
+# 0x3fb7171720000000) — enough to break a bit-exact golden comparison.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+ibi-correct = { path = "../ibi-correct" }

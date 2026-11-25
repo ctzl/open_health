@@ -1,0 +1,26 @@
+[package]
+name = "oura-models"
+description = "Local Rust re-implementations of the tools/run_*_model.py pipelines (cva, activity, illness, stress) — same DB, same JSON, no Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# tch 0.26 targets libtorch 2.13 — the venv is pinned to torch==2.13.0+cpu to
+# match (repo convention: venv and tch pin in lockstep; tch 0.27 needs torch
+# 2.15, which has no cp310 wheel; 0.22/0.26 C++17 shims don't compile against
+# torch >=2.14 headers). Build with the venv activated + LIBTORCH_USE_PYTORCH=1.
+tch = { version = "=0.26.0", optional = true }
+
+[features]
+default = []
+torch = ["dep:tch"]
+
+[[bin]]
+name = "oura-models"
+path = "src/main.rs"

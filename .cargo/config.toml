@@ -1,0 +1,6 @@
+# torch-sys (tch) build on Windows: link against the repo venv's libtorch
+# (2.13.0+cpu). Activate the venv before building with --features torch, or
+# cargo won't find torch's DLLs via python discovery.
+[env]
+LIBTORCH_USE_PYTORCH = "1"
+CXXFLAGS = "/std:c++20"

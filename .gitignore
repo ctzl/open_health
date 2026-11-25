@@ -47,3 +47,18 @@ apps/ios/OuraApp/project-model-validation.yml
 # Real-data golden vectors: personal health data, local-only (regenerate
 # with tools/gen_ibi_vectors.py). Synthetic vectors stay committed.
 crates/ibi-correct/tests/vectors/real_*.json
+
+# Real-data golden vectors (captured from the personal DB): local-only.
+# Regenerate with tools/nssa_plumbing_golden.py. Tests SKIP without them.
+crates/nssa-plumbing/tests/vectors/
+crates/oura-models/tests/vectors/
+
+# Local scratch / probe artifacts (may contain personal data): never commit.
+/check_now.log
+/combined.json
+/*_battery.json
+/*_pairs.json
+/*_staged.json
+/prof_sleep.py
+/tch_probe*.log
+/torch_downgrade.log
