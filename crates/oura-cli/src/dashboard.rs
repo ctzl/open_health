@@ -40,6 +40,9 @@ const PROFILE_JS: &str = include_str!("../../../dashboard/web/profile.js");
 const LOGS_HTML: &str = include_str!("../../../dashboard/web/logs.html");
 const LOGS_JS: &str = include_str!("../../../dashboard/web/logs.js");
 const LOGS_CSS: &str = include_str!("../../../dashboard/web/logs.css");
+const RING_HTML: &str = include_str!("../../../dashboard/web/ring.html");
+const RING_JS: &str = include_str!("../../../dashboard/web/ring.js");
+const RING_CSS: &str = include_str!("../../../dashboard/web/ring.css");
 
 fn read_ring_key(path: Option<&Path>) -> Result<String> {
     let path = path.ok_or_else(|| anyhow!("dashboard was started without --key-file"))?;
@@ -1825,6 +1828,33 @@ async fn handle(
             )
             .await
         }
+        (_, "/ring") | (_, "/ring.html") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/html; charset=utf-8",
+                &asset("ring.html", RING_HTML),
+            )
+            .await
+        }
+        (_, "/ring.js") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/javascript; charset=utf-8",
+                &asset("ring.js", RING_JS),
+            )
+            .await
+        }
+        (_, "/ring.css") => {
+            write_resp(
+                &mut sock,
+                "200 OK",
+                "text/css; charset=utf-8",
+                &asset("ring.css", RING_CSS),
+            )
+            .await
+        }
         ("GET", "/api/logs") => {
             // The /logs page's feed: activity ring (syncs, model runs, live-HR,
             // feature toggles; persisted to activity_log.jsonl), newest first.
@@ -1988,6 +2018,16 @@ async fn handle(
                 ),
                 Err(e) => json!({ "error": e.to_string() }),
             };
+            json_resp(&mut sock, &v).await
+        }
+        ("GET", "/api/ring-diagnostics") => {
+            // The /ring page: health view for every registered ring (or one via
+            // ?serial=). Computed from the DB per request; cheap enough (last
+            // 30 days of batch anchors).
+            let serial = query_param(query, "serial").unwrap_or_default();
+            let v = tokio::task::spawn_blocking(move || ring_diagnostics(&db, &serial))
+                .await
+                .unwrap_or_else(|e| json!({ "error": e.to_string() }));
             json_resp(&mut sock, &v).await
         }
         ("POST", "/api/rings") => {
@@ -2322,6 +2362,370 @@ fn describe_ring(db: &Path, name_filter: &str, serial: &str) -> String {
         "name-filter=\"{name_filter}\" (no serial; registered: {})",
         if listed.is_empty() { "none".to_string() } else { listed.join(", ") }
     )
+}
+
+/// Per-ring health data for the `/ring` diagnostics page: identity and key
+/// provenance, sync state, a 14-day wearing-coverage heatmap, recording gaps,
+/// per-stream last-seen times, and recent activity-log entries that mention
+/// the ring. All derived from the DB at request time.
+///
+/// Coverage is grounded in the sensing streams themselves: the ring produces
+/// IBI / heart-rate / motion samples continuously while powered and worn, so
+/// an hour with zero such samples is a real not-recording period. (A lagging
+/// tick counter is NOT evidence of a gap: buffered replays and clock re-syncs
+/// break any batch-boundary method — proven on a 24/7-worn ring whose every
+/// "counter stall" contained thousands of buffered samples.)
+///
+/// Ring ticks (`ring_timestamp`, deciseconds) are mapped to wall clock through
+/// `time_sync` events, which carry the phone's unix time next to the ring's
+/// counter — exact piecewise-linear anchors. Each gap is then characterised:
+/// a `ring_start` boot at resume means the ring powered off (dead battery);
+/// a battery reading that rose across the gap means it was on the charger;
+/// otherwise the ring simply saw nothing (off-finger in a drawer).
+/// Event names carry no index in the events table, but their numeric `tag`
+/// does (UNIQUE(serial, tag, ring_timestamp, body)). Resolve the mapping once
+/// per process so every diagnostics query can use the index.
+fn event_tags(conn: &rusqlite::Connection) -> &std::collections::HashMap<String, i64> {
+    static TAGS: std::sync::OnceLock<std::collections::HashMap<String, i64>> =
+        std::sync::OnceLock::new();
+    TAGS.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        if let Ok(mut s) = conn.prepare("SELECT name, tag FROM events GROUP BY name, tag") {
+            if let Ok(q) = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                for (n, t) in q.filter_map(|v| v.ok()) {
+                    m.entry(n).or_insert(t);
+                }
+            }
+        }
+        m
+    })
+}
+
+/// The scan is minute-scale, so serve the full-list result from a short-lived
+/// cache; the page polls and several viewers shouldn't each pay for it.
+fn ring_diagnostics(db: &Path, only_serial: &str) -> Value {
+    if !only_serial.is_empty() {
+        return ring_diagnostics_inner(db, only_serial);
+    }
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Value)>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(9999), Value::Null)));
+    if let Ok(g) = cache.lock() {
+        if g.0.elapsed().as_secs() < 300 {
+            return g.1.clone();
+        }
+    }
+    let v = ring_diagnostics_inner(db, "");
+    if let Ok(mut g) = cache.lock() {
+        *g = (std::time::Instant::now(), v.clone());
+    }
+    v
+}
+
+fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
+    const COVERAGE_DAYS: i64 = 14;
+    const GAP_MIN_S: i64 = 3600; // hour-granularity: gaps of >= 1 empty hour
+    const MAX_GAPS: usize = 40;
+    let conn = match rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => return json!({ "error": e.to_string() }),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT r.serial, r.name, r.key_source, r.note, r.added_unix, r.last_seen_unix,
+                d.firmware, d.api_version, d.mac, s.last_sync_unix
+         FROM rings r LEFT JOIN device d ON d.serial = r.serial
+         LEFT JOIN sync_state s ON s.serial = r.serial
+         WHERE (?1 = '' OR r.serial = ?1)
+         ORDER BY r.added_unix",
+    ) {
+        Ok(s) => s,
+        Err(e) => return json!({ "error": e.to_string() }),
+    };
+    let rings: Vec<(String, String, String, String, i64, i64, String, String, String, i64)> = stmt
+        .query_map(rusqlite::params![only_serial], |r| {
+            let opt = |i: usize| -> String { r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default() };
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                opt(2),
+                opt(3),
+                r.get(4)?,
+                r.get(5)?,
+                opt(6),
+                opt(7),
+                opt(8),
+                r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+            ))
+        })
+        .ok()
+        .map(|q| q.filter_map(|v| v.ok()).collect())
+        .unwrap_or_default();
+    let tags = event_tags(&conn);
+    let mut out: Vec<Value> = Vec::new();
+    for (serial, name, key_source, note, added_s, last_seen_s, firmware, api_version, mac, last_sync_s) in rings {
+        let (tag_sync, tag_start, tag_dbg) = (
+            tags.get("time_sync").copied(),
+            tags.get("ring_start").copied(),
+            tags.get("debug_data").copied(),
+        );
+        let tags_live: Vec<i64> = ["ibi_and_amplitude_event", "ehr_trace_event", "motion_event"]
+            .iter()
+            .filter_map(|n| tags.get(*n).copied())
+            .collect();
+        if tags_live.is_empty() {
+            continue;
+        }
+        // Clock anchors: time_sync events pair the ring's tick counter with the
+        // phone's wall clock. Piecewise-linear map between them; cleaned so both
+        // sequences advance (clock re-syncs make the raw list non-monotonic).
+        let Some(tag_sync) = tag_sync else { continue };
+        let mut stmt = match conn.prepare(
+            "SELECT ring_timestamp, decoded_json FROM events
+             WHERE serial = ?1 AND tag = ?2 AND decoded_json IS NOT NULL
+             ORDER BY ring_timestamp",
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut anchors: Vec<(i64, i64)> = Vec::new();
+        let rows = stmt.query_map(rusqlite::params![&serial, tag_sync], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        });
+        if let Ok(q) = rows {
+            for (rt, dj) in q.filter_map(|v| v.ok()) {
+                let Some(dj) = dj else { continue };
+                let Ok(parsed) = serde_json::from_str::<Value>(&dj) else { continue };
+                let Some(u) = parsed.get("unix_time").and_then(Value::as_i64) else {
+                    continue;
+                };
+                match anchors.last() {
+                    // keep ticks strictly increasing; tolerate small wall-clock
+                    // nudges but drop large backward re-syncs
+                    Some(&(lrt, lu)) if rt > lrt && u >= lu - 3600 => anchors.push((rt, u)),
+                    None => anchors.push((rt, u)),
+                    _ => {}
+                }
+            }
+        }
+        if anchors.len() < 2 {
+            continue; // no clock map for this ring: nothing defensible to report
+        }
+        let to_wall = |rt: i64| -> i64 {
+            let i = anchors.partition_point(|&(r, _)| r <= rt).saturating_sub(1);
+            let (r0, u0) = anchors[i];
+            let (r1, u1) = anchors[(i + 1).min(anchors.len() - 1)];
+            if r1 <= r0 {
+                u0
+            } else {
+                u0 + (rt - r0) * (u1 - u0) / (r1 - r0)
+            }
+        };
+        let to_tick = |u: i64| -> i64 {
+            // inverse of to_wall over the anchor list
+            let i = anchors.iter().rposition(|&(_, w)| w <= u).unwrap_or(0);
+            let (r0, u0) = anchors[i];
+            let (r1, u1) = anchors[(i + 1).min(anchors.len() - 1)];
+            if u1 <= u0 {
+                r0
+            } else {
+                r0 + (u - u0) * (r1 - r0) / (u1 - u0)
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cov_start = ((now - COVERAGE_DAYS * 86400) / 3600) * 3600;
+        // Coverage: hours containing at least one sensing sample (IBI, EHR,
+        // motion). The ring emits these continuously while powered and worn,
+        // so an empty hour is a real not-recording period — buffered replays
+        // carry original tick times, so late delivery cannot fake a gap here.
+        let scan_from = to_tick(cov_start) - 2_000_000; // margin for tick/wall drift
+        // Bucket per tick-hour in SQL (ring_timestamp is deciseconds): the map
+        // to wall clock is near-identity, so per-bucket mapping is plenty and
+        // the query returns ~340 rows instead of ~1M.
+        let mut sql = String::from(
+            "SELECT ring_timestamp / 36000, MIN(ring_timestamp), MAX(ring_timestamp) FROM events\n             WHERE serial = ?1 AND ring_timestamp > ?2 AND (",
+        );
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![&serial, &scan_from];
+        for (i, t) in tags_live.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR");
+            }
+            sql.push_str(&format!(" tag = ?{}", i + 3));
+            bind.push(t);
+        }
+        sql.push_str(") GROUP BY 1");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut live_hours: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        // Spanning a bucket across its wall-clock range is only sound while the
+        // anchor segment maps ticks ~1:1 to seconds. When a ring powers off its
+        // tick clock freezes until the next time_sync, and that segment's ratio
+        // explodes — a single bucket would then paint the whole powered-off
+        // window "live". Detect abnormal segments and map such buckets to a
+        // single hour instead.
+        let seg_ok = |t: i64| -> bool {
+            let i = anchors.partition_point(|&(r, _)| r <= t).saturating_sub(1);
+            let (r0, u0) = anchors[i];
+            let (r1, u1) = anchors[(i + 1).min(anchors.len() - 1)];
+            r1 <= r0 || (u1 - u0).max(0) * 10 <= 2 * (r1 - r0) + 600
+        };
+        {
+            let rows = stmt.query_map(bind.as_slice(), |r| Ok((r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)));
+            if let Ok(q) = rows {
+                for (t0, t1) in q.filter_map(|v| v.ok()) {
+                    // Span only real sample ticks (not bucket edges): the gap
+                    // edges are exactly where fictitious edges would lie.
+                    let (w0, w1) = if seg_ok(t0) && seg_ok(t1) {
+                        (to_wall(t0), to_wall(t1))
+                    } else {
+                        let m = to_wall((t0 + t1) / 2);
+                        (m, m)
+                    };
+                    if w1 >= cov_start {
+                        for hh in (w0.max(cov_start) / 3600)..=(w1 / 3600) {
+                            live_hours.insert(hh);
+                        }
+                    }
+                }
+            }
+        }
+        drop(stmt);
+        // Recording gaps: runs of >= 1 empty hour on the hour grid, kept to the
+        // most recent MAX_GAPS; each is then characterised (boot / battery).
+        let boots: Vec<i64> = {
+            let mut acc: Vec<i64> = Vec::new();
+            if let (Some(tag_start), Ok(mut stmt)) = (
+                tag_start,
+                conn.prepare("SELECT ring_timestamp FROM events WHERE serial = ?1 AND tag = ?2"),
+            ) {
+                if let Ok(q) = stmt.query_map(rusqlite::params![&serial, tag_start], |r| r.get::<_, i64>(0)) {
+                    acc = q.filter_map(|v| v.ok()).map(&to_wall).collect();
+                }
+            }
+            acc
+        };
+        let battery_at = |rt: i64, before: bool| -> Option<(i64, i64, i64)> {
+            let tag_dbg = tag_dbg?;
+            let (op, dir) = if before { ("<=", "DESC") } else { (">=", "ASC") };
+            let sql = format!(
+                "SELECT ring_timestamp, decoded_json FROM events
+                 WHERE serial = ?1 AND tag = ?2 AND ring_timestamp {op} ?3
+                 ORDER BY ring_timestamp {dir} LIMIT 300"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            let rows = stmt.query_map(rusqlite::params![&serial, tag_dbg, rt], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            });
+            // nearest row that actually carries a battery reading
+            for (rt0, dj) in rows.ok()?.filter_map(|v| v.ok()) {
+                let Some(dj) = dj else { continue };
+                let Ok(parsed) = serde_json::from_str::<Value>(&dj) else { continue };
+                let Some(pct) = parsed.get("battery_pct").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let mv = parsed.get("voltage_mv").and_then(Value::as_i64).unwrap_or(-1);
+                return Some((to_wall(rt0), pct, mv));
+            }
+            None
+        };
+        let mut gaps: Vec<Value> = Vec::new();
+        let mut h = cov_start / 3600;
+        let h_end = now / 3600;
+        while h <= h_end {
+            if !live_hours.contains(&h) {
+                let gs = h * 3600;
+                while h + 1 <= h_end && !live_hours.contains(&(h + 1)) {
+                    h += 1;
+                }
+                let ge = (h + 1) * 3600 - 1;
+                if ge - gs >= GAP_MIN_S {
+                    let boot = boots
+                        .iter()
+                        .any(|&b| b >= gs - 300 && b <= ge + 900);
+                    let bb = battery_at(to_tick(gs), true);
+                    let ba = battery_at(to_tick(ge), false);
+                    let kind = if boot {
+                        "power-off"
+                    } else if bb
+                        .as_ref()
+                        .zip(ba.as_ref())
+                        .is_some_and(|(b, a)| a.1 > b.1 + 5)
+                    {
+                        "charging"
+                    } else {
+                        "idle"
+                    };
+                    let batt = |b: &Option<(i64, i64, i64)>| match b {
+                        Some((s, p, v)) => json!({ "s": s, "pct": p, "mv": v }),
+                        None => Value::Null,
+                    };
+                    gaps.push(json!({
+                        "from_s": gs, "to_s": ge, "dur_s": ge - gs,
+                        "kind": kind, "boot": boot,
+                        "batt_before": batt(&bb), "batt_after": batt(&ba),
+                    }));
+                }
+            }
+            h += 1;
+        }
+        if gaps.len() > MAX_GAPS {
+            gaps.drain(..gaps.len() - MAX_GAPS);
+        }
+        let coverage: Vec<Value> = live_hours.iter().map(|h| json!({ "h": h })).collect();
+        // Per-stream last-seen, oldest first: a stream that died is a clue.
+        let mut stmt = match conn.prepare(
+            "SELECT tag, MAX(captured_unix), COUNT(*) FROM events WHERE serial = ?1
+             GROUP BY tag ORDER BY MAX(captured_unix) ASC LIMIT 15",
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let streams: Vec<Value> = stmt
+            .query_map(rusqlite::params![&serial], |r| {
+                let tag = r.get::<_, i64>(0)? as u8;
+                Ok(json!({
+                    "name": oura_protocol::events::event_name(tag),
+                    "last_s": r.get::<_, i64>(1)?,
+                    "count": r.get::<_, i64>(2)?,
+                }))
+            })
+            .ok()
+            .map(|q| q.filter_map(|v| v.ok()).collect())
+            .unwrap_or_default();
+        // Activity-log entries that mention this ring (sync attempts, failures).
+        let log: Vec<Value> = list_activity("", 400)
+            .into_iter()
+            .filter(|e| e["detail"].as_str().is_some_and(|d| d.contains(&serial)))
+            .take(12)
+            .collect();
+        out.push(json!({
+            "serial": serial,
+            "name": name,
+            "key_source": key_source,
+            "note": note,
+            "added_s": added_s,
+            "last_seen_s": last_seen_s,
+            "firmware": firmware,
+            "api_version": api_version,
+            "mac": mac,
+            "last_sync_s": last_sync_s,
+            "coverage": coverage,
+            "gaps": gaps,
+            "streams": streams,
+            "log": log,
+        }));
+    }
+    json!({ "rings": out })
 }
 
 /// Drain the ring by invoking our own binary's `sync` subcommand (reuses all the
