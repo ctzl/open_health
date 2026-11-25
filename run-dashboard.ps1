@@ -25,6 +25,15 @@ $db      = Join-Path (Split-Path $repo -Parent) 'open_oura\oura.db'
 $keyFile = Join-Path (Split-Path $repo -Parent) 'open_oura\key.hex'
 $exe     = Join-Path $repo 'target\release\oura.exe'
 
+# In-process models (cva/activity/illness/stress in Rust) need the venv's torch:
+# build with --features torch when it exists, and put its DLL dir on PATH so the
+# binary can load them. Without a venv the dashboard falls back to Python
+# subprocesses (or the signal estimator) exactly as before.
+$venvPy   = Join-Path $repo '.venv\Scripts\python.exe'
+$torchDll = Join-Path $repo '.venv\Lib\site-packages\torch\lib'
+$features = @()
+if (Test-Path $venvPy) { $features = @('--features', 'torch') }
+
 # --- sanity checks -----------------------------------------------------------
 if (-not (Test-Path $db))      { Write-Error "database not found: $db";      exit 1 }
 if (-not (Test-Path $keyFile)) { Write-Error "auth key not found: $keyFile"; exit 1 }
@@ -33,9 +42,10 @@ if ($Build) {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         $env:PATH = "$HOME\.cargo\bin;$env:PATH"   # rustup default install location
     }
-    Write-Host 'building oura-cli (release)...'
+    $feat = if ($features) { ' + torch models' } else { '' }
+    Write-Host "building oura-cli (release)$feat..."
     Push-Location $repo
-    try { cargo build --release -p oura-cli; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+    try { cargo build --release -p oura-cli @features; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
     finally { Pop-Location }
 }
 
@@ -43,6 +53,10 @@ if (-not (Test-Path $exe)) {
     Write-Error "oura.exe not built yet. Run: .\un-dashboard.ps1 -Build"
     exit 1
 }
+
+# A torch-built binary loads torch DLLs at start-up; the venv's copy is the one
+# tch was linked against (2.13). Prepend it so the exe finds them.
+if (Test-Path $torchDll) { $env:PATH = "$torchDll;$env:PATH" }
 
 # warn if something is already listening on the port (usually a previous dashboard)
 if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
@@ -80,6 +94,11 @@ Write-Host "log: $log"
 # The binary emits UTF-8; decode its output as UTF-8 (not the OEM codepage)
 # so em-dashes and timestamps survive the tee.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# Native stderr (e.g. torch C++ warnings) arrives as ErrorRecords. If the
+# caller's session has ErrorActionPreference='Stop', the 2>&1 merge below turns
+# the first such line into a terminating error and PowerShell kills the server
+# (exit 1, no panic). The ForEach already handles ErrorRecords, so pin Continue.
+$ErrorActionPreference = 'Continue'
 $esc = [char]27
 & $exe dashboard --db $db --key-file $keyFile --tz-offset $tzOffset --port $Port @bloodArgs @lanArgs 2>&1 |
     ForEach-Object {

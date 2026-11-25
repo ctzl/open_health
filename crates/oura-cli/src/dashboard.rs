@@ -446,6 +446,82 @@ fn run_py_json_stdin_optional(
     }
 }
 
+/// The argv each model runner is invoked with — shared by [`PythonRunner`] and
+/// [`RustRunner`] so the two backends can never drift apart in what they ask
+/// for (the in-process entry points take the exact same argv as the scripts).
+struct ModelArgv {
+    sleep: Vec<String>,
+    sleep_stdin: Vec<u8>,
+    cva: Vec<String>,
+    activity: Vec<String>,
+    illness: Vec<String>,
+    stress: Vec<String>,
+}
+
+fn model_argv(
+    db: &Path,
+    tz: f64,
+    demo: &Demographics,
+    sleep_ranges: &[[i64; 3]],
+    serial: &str,
+) -> ModelArgv {
+    let sleep_stdin = serde_json::to_vec(sleep_ranges).unwrap_or_default();
+    let sleep = vec![
+        db.display().to_string(),
+        tz.to_string(),
+        "--json".into(),
+        "--batch".into(),
+        "--serial".into(),
+        serial.to_string(),
+    ];
+    let cva = vec![
+        db.display().to_string(),
+        "--json".into(),
+        "--sex".into(),
+        demo.sex.to_string(),
+        "--age".into(),
+        demo.age.to_string(),
+        "--height".into(),
+        demo.height_m.to_string(),
+        "--weight".into(),
+        demo.weight_kg.to_string(),
+        "--ring".into(),
+        demo.ring_size.to_string(),
+        "--serial".into(),
+        serial.to_string(),
+    ];
+    let activity = vec![
+        db.display().to_string(),
+        "--tz".into(),
+        tz.to_string(),
+        "--json".into(),
+        "--serial".into(),
+        serial.to_string(),
+    ];
+    let illness = vec![db.display().to_string(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
+    let stress = vec![db.display().to_string(), "--tz".into(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
+    ModelArgv { sleep, sleep_stdin, cva, activity, illness, stress }
+}
+
+/// The signal-estimator top-up both runners share: a missing or partial sleep
+/// batch is filled from the Rust per-night estimator (see
+/// [`sleep_batch_needs_fallback`]).
+fn finish_sleep(
+    sleep_batch: Option<Value>,
+    db: &Path,
+    sleep_ranges: &[[i64; 3]],
+    serial: &str,
+) -> Option<Value> {
+    let mut sleep_batch = sleep_batch;
+    if sleep_batch_needs_fallback(sleep_batch.as_ref(), sleep_ranges.len())
+        && !sleep_ranges.is_empty()
+    {
+        let signals = oura_summary::stage_nights_from_signals(db, sleep_ranges, Some(serial));
+        sleep_batch = merge_sleep_fallback(sleep_batch, signals);
+    }
+    sleep_batch
+}
+
 /// The web dashboard's [`ModelRunner`]: shells out to the Python torch runners,
 /// exactly as before, and falls back to Rust signal-based sleep staging when the
 /// Python environment or private `.pt` model file is unavailable on a user's PC.
@@ -461,52 +537,18 @@ impl ModelRunner for PythonRunner {
         } = input;
         let root = repo_root();
         let py = root.as_deref().map(python_bin);
-        let sleep_stdin = serde_json::to_vec(sleep_ranges).unwrap_or_default();
-        let sleep_args = vec![
-            db.display().to_string(),
-            tz.to_string(),
-            "--json".into(),
-            "--batch".into(),
-            "--serial".into(),
-            serial.to_string(),
-        ];
-        let cva_args = vec![
-            db.display().to_string(),
-            "--json".into(),
-            "--sex".into(),
-            demo.sex.to_string(),
-            "--age".into(),
-            demo.age.to_string(),
-            "--height".into(),
-            demo.height_m.to_string(),
-            "--weight".into(),
-            demo.weight_kg.to_string(),
-            "--ring".into(),
-            demo.ring_size.to_string(),
-            "--serial".into(),
-            serial.to_string(),
-        ];
-        let act_args = vec![
-            db.display().to_string(),
-            "--tz".into(),
-            tz.to_string(),
-            "--json".into(),
-            "--serial".into(),
-            serial.to_string(),
-        ];
-        let illness_args = vec![db.display().to_string(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
-        let stress_args = vec![db.display().to_string(), "--tz".into(), tz.to_string(), "--json".into(), "--serial".into(), serial.to_string()];
+        let argv = model_argv(db, tz, demo, sleep_ranges, serial);
 
-        let (mut sleep_batch, cva, activity, illness, stress) = match (root.as_deref(), py.as_deref()) {
+        let (sleep_batch, cva, activity, illness, stress) = match (root.as_deref(), py.as_deref()) {
             (Some(r), Some(p)) => std::thread::scope(|s| {
                 let sh = s.spawn(|| {
-                    run_py_json_stdin(r, p, "tools/run_sleep_model.py", &sleep_args, &sleep_stdin)
+                    run_py_json_stdin(r, p, "tools/run_sleep_model.py", &argv.sleep, &argv.sleep_stdin)
                 });
-                let ch = s.spawn(|| run_py_json(r, p, "tools/run_cva_model.py", &cva_args));
-                let ah = s.spawn(|| run_py_json(r, p, "tools/run_activity_model.py", &act_args));
-                let ih = s.spawn(|| run_py_json(r, p, "tools/run_illness_model.py", &illness_args));
+                let ch = s.spawn(|| run_py_json(r, p, "tools/run_cva_model.py", &argv.cva));
+                let ah = s.spawn(|| run_py_json(r, p, "tools/run_activity_model.py", &argv.activity));
+                let ih = s.spawn(|| run_py_json(r, p, "tools/run_illness_model.py", &argv.illness));
                 let sh2 = s.spawn(|| {
-                    run_py_json(r, p, "tools/run_stress_events.py", &stress_args)
+                    run_py_json(r, p, "tools/run_stress_events.py", &argv.stress)
                 });
                 (
                     sh.join().ok().flatten(),
@@ -518,12 +560,7 @@ impl ModelRunner for PythonRunner {
             }),
             _ => (None, None, None, None, None),
         };
-        if sleep_batch_needs_fallback(sleep_batch.as_ref(), sleep_ranges.len())
-            && !sleep_ranges.is_empty()
-        {
-            let signals = oura_summary::stage_nights_from_signals(db, sleep_ranges, Some(serial));
-            sleep_batch = merge_sleep_fallback(sleep_batch, signals);
-        }
+        let sleep_batch = finish_sleep(sleep_batch, db, sleep_ranges, serial);
         ModelOutputs {
             sleep_batch,
             cva,
@@ -532,6 +569,132 @@ impl ModelRunner for PythonRunner {
             stress,
         }
     }
+}
+
+/// The web dashboard's in-process [`ModelRunner`] (built with `--features
+/// torch`): cva / activity / illness / stress run through the `oura-models`
+/// crate — same argv contract as the Python scripts, golden-tested against them
+/// — with no interpreter start-up and no process boundary. Sleep staging stays
+/// on Python (its model is not ported). Any model that fails in Rust falls back
+/// to that model's Python script, so a broken Rust path can never take a panel
+/// down; `OURA_DASHBOARD_PYTHON=1` forces the whole runner back to Python even
+/// in a torch build (A/B benching).
+#[cfg(feature = "torch")]
+struct RustRunner;
+
+#[cfg(feature = "torch")]
+impl ModelRunner for RustRunner {
+    fn run(&self, input: ModelInputs) -> ModelOutputs {
+        let ModelInputs {
+            db,
+            tz,
+            demo,
+            sleep_ranges,
+            serial,
+        } = input;
+        let root = repo_root();
+        let py = root.as_deref().map(python_bin);
+        let argv = model_argv(db, tz, demo, sleep_ranges, serial);
+        // oura-models resolves its .pt files from its own manifest, but
+        // activity's repo_root() reads OURA_REPO (then cwd) — pin it to the
+        // checkout the dashboard is running from.
+        if let (Some(r), None) = (root.as_deref(), std::env::var_os("OURA_REPO")) {
+            std::env::set_var("OURA_REPO", r);
+        }
+
+        let (sleep_batch, cva, activity, illness, stress) = match (root.as_deref(), py.as_deref()) {
+            (Some(r), Some(p)) => std::thread::scope(|s| {
+                let sh = s.spawn(|| {
+                    run_py_json_stdin(r, p, "tools/run_sleep_model.py", &argv.sleep, &argv.sleep_stdin)
+                });
+                let ch = s.spawn(|| {
+                    run_rust_model("cva", "tools/run_cva_model.py", r, p, &argv.cva, || {
+                        oura_models::cva::json_for_args(&argv.cva)
+                    })
+                });
+                let ah = s.spawn(|| {
+                    run_rust_model("activity", "tools/run_activity_model.py", r, p, &argv.activity, || {
+                        // Incremental dispatch: replays cached days, recomputes
+                        // only what new rows dirtied; falls back to the cold
+                        // path internally when no valid cache exists.
+                        oura_models::incremental::json_for_args(&argv.activity)
+                    })
+                });
+                let ih = s.spawn(|| {
+                    run_rust_model("illness", "tools/run_illness_model.py", r, p, &argv.illness, || {
+                        oura_models::illness::json_for_args(&argv.illness)
+                    })
+                });
+                let sh2 = s.spawn(|| {
+                    run_rust_model("stress", "tools/run_stress_events.py", r, p, &argv.stress, || {
+                        oura_models::stress::json_for_args(&argv.stress)
+                    })
+                });
+                (
+                    sh.join().ok().flatten(),
+                    ch.join().ok().flatten(),
+                    ah.join().ok().flatten(),
+                    ih.join().ok().flatten(),
+                    sh2.join().ok().flatten(),
+                )
+            }),
+            _ => (None, None, None, None, None),
+        };
+        let sleep_batch = finish_sleep(sleep_batch, db, sleep_ranges, serial);
+        ModelOutputs {
+            sleep_batch,
+            cva,
+            activity,
+            illness,
+            stress,
+        }
+    }
+}
+
+/// One model through the in-process path, with its Python script as fallback.
+/// Deduped like the Python path — the slot key hashes the backend tag too, so a
+/// Rust run and a Python run of the same model never share a slot.
+#[cfg(feature = "torch")]
+fn run_rust_model(
+    label: &str,
+    py_script: &str,
+    root: &Path,
+    py: &Path,
+    args: &[String],
+    rust: impl FnOnce() -> Result<String>,
+) -> Option<Value> {
+    let run_py = || run_py_json(root, py, py_script, args);
+    let Some((key, serial)) = model_key(&format!("rust/{label}"), args, None) else {
+        return run_py();
+    };
+    dedup_model_run(&format!("rust/{label}"), &serial, key, || {
+        let started = std::time::Instant::now();
+        // A panic inside a model escapes thread::scope and takes down the whole
+        // server (seen once with concurrent torch init). Treat it like an Err:
+        // log it and fall back to the Python runner.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rust))
+            .map_err(|_| anyhow!("{label} (rust) panicked"))
+            .and_then(|inner| inner)
+            .and_then(|json| {
+                serde_json::from_str::<Value>(&json)
+                    .map_err(|e| anyhow!("{label}: output was not valid JSON — {e}"))
+            });
+        let ms = started.elapsed().as_millis();
+        match outcome {
+            Ok(v) => {
+                log_activity("model", "ok", &format!("{label} (rust): {ms} ms"));
+                Some(v)
+            }
+            Err(e) => {
+                log_activity(
+                    "model",
+                    "failed",
+                    &format!("{label} (rust): {ms} ms — {e}; falling back to {py_script}"),
+                );
+                run_py()
+            }
+        }
+    })
 }
 
 /// Whether the Python sleep batch must be topped up from the signal estimator.
@@ -580,9 +743,19 @@ fn merge_sleep_fallback(python: Option<Value>, signals: Option<Value>) -> Option
     Some(Value::Array(merged))
 }
 
-/// `build_summary` for the web dashboard — runs the models via Python.
+/// `build_summary` for the web dashboard. Built with `--features torch` it runs
+/// cva/activity/illness/stress in-process (RustRunner, per-model Python
+/// fallback); otherwise it shells out to Python as before.
 fn build_summary(db: &Path, tz: f64, serial: Option<&str>) -> Result<Value> {
-    oura_summary::build_summary(db, tz, serial, &PythonRunner)
+    #[cfg(feature = "torch")]
+    let runner: &dyn ModelRunner = if std::env::var_os("OURA_DASHBOARD_PYTHON").is_some() {
+        &PythonRunner
+    } else {
+        &RustRunner
+    };
+    #[cfg(not(feature = "torch"))]
+    let runner: &dyn ModelRunner = &PythonRunner;
+    oura_summary::build_summary(db, tz, serial, runner)
 }
 
 // ── summary cache ─────────────────────────────────────────────────────────────
@@ -1986,6 +2159,33 @@ fn warm_summaries(db: &Path) {
     }
 }
 
+/// Human-readable sync target for the activity log: the GATT serial plus the
+/// display name from the ring switcher (rings table). The old bare
+/// `name=Oura` label was the CLI's default BLE name filter, not a real ring —
+/// registered rings carry user-chosen names, so the log must show which
+/// physical ring a sync targets.
+fn describe_ring(db: &Path, name_filter: &str, serial: &str) -> String {
+    let rings = oura_store::storage::Store::open_read_only(db)
+        .and_then(|s| s.list_rings())
+        .unwrap_or_default();
+    if !serial.is_empty() {
+        return match rings.iter().find(|r| r.0 == serial) {
+            Some(r) => format!("serial={serial} name=\"{}\"", r.1),
+            None => format!("serial={serial} (not in rings table)"),
+        };
+    }
+    // No serial: the CLI child picks by advertised BLE name (`--name` filter).
+    // Say so, and list what is actually registered so the ambiguity is visible.
+    let listed: Vec<String> = rings
+        .iter()
+        .map(|r| format!("{}=\"{}\"", r.0, r.1))
+        .collect();
+    format!(
+        "name-filter=\"{name_filter}\" (no serial; registered: {})",
+        if listed.is_empty() { "none".to_string() } else { listed.join(", ") }
+    )
+}
+
 /// Drain the ring by invoking our own binary's `sync` subcommand (reuses all the
 /// BLE + cursor logic). Returns the last stdout line on success.
 ///
@@ -2012,11 +2212,7 @@ fn run_sync(db: &Path, name: &str, serial: &str, key_file: Option<&Path>) -> Res
         .unwrap_or_else(|e| e.into_inner())
         .insert(db.to_path_buf());
     let exe = std::env::current_exe().context("locating oura binary")?;
-    let target = if serial.is_empty() {
-        format!("name={name}")
-    } else {
-        format!("serial={serial}")
-    };
+    let target = describe_ring(db, name, serial);
     log_activity("sync", "start", &format!("sync started ({target})"));
     let started = std::time::Instant::now();
     let mut last = String::from("sync failed");
