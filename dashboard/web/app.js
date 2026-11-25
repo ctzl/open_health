@@ -589,6 +589,30 @@ function renderSpo2(d) {
   g.append(fill);
   box.append(g);
   box.append(el("div", "scale", `<span>${SPO2_MIN}</span><span>healthy ≥ ${SPO2_HEALTHY}</span><span>100</span>`));
+  // min + low-desaturation episodes (10 s bins under 90%, 30 s bridging — computed
+  // server-side in spo2_low_events) and perfusion index from the same packets.
+  const kvs = el("div", "kvs");
+  const hm = (unix) => {
+    const t = new Date(unix * 1000);
+    return `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
+  };
+  kvs.append(el("div", "kv", `<div class="k">Lowest SpO₂</div><div class="v">${n0.spo2_min != null ? n0.spo2_min + "%" : "—"}</div>`));
+  const evs = n0.spo2_low_events || [];
+  const totMin = Math.round(evs.reduce((a, e) => a + e.duration_s, 0) / 60);
+  kvs.append(el("div", "kv", `<div class="k">Low-SpO₂ episodes</div><div class="v">${evs.length ? `${evs.length} · ${totMin} min total` : "none"}</div>`));
+  if (n0.perf_mean != null) {
+    // perf_* is a 0..1 fraction in the summary JSON (same scale as the `perf` lane)
+    const pc = (x) => (x * 100).toFixed(1) + "%";
+    kvs.append(el("div", "kv", `<div class="k">Perfusion index</div><div class="v">${pc(n0.perf_mean)}${n0.perf_min != null ? ` (min ${pc(n0.perf_min)})` : ""}</div>`));
+  }
+  box.append(kvs);
+  if (evs.length) {
+    box.append(el("div", "sub", "Episodes below 90% (10 s bins):"));
+    for (const e of evs.slice(0, 8)) {
+      box.append(el("div", "sub", `${hm(e.start_s)}–${hm(e.end_s)} · ${Math.max(1, Math.round(e.duration_s / 60))} min · min ${e.min_pct}%`));
+    }
+    if (evs.length > 8) box.append(el("div", "sub", `… ${evs.length - 8} more`));
+  }
 }
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];

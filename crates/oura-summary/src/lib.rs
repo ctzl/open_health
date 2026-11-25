@@ -12,6 +12,10 @@
 //! *render* it: web `dashboard/web/app.js`, iOS `apps/ios/OuraApp/OuraApp.swift`. See
 //! `docs/clients-web-and-ios.md`.
 
+// `night_json` is one large `json!` literal; the added SpO2/PI keys pushed it past
+// the default macro-expansion recursion limit.
+#![recursion_limit = "256"]
+
 pub mod hourly_hr;
 pub mod research_export;
 pub mod ring_time;
@@ -2058,6 +2062,51 @@ fn timed_series(
         .collect()
 }
 
+/// Low-SpO2 episodes (Oura-style): bin the `(time_ds, pct)` lane into 10 s bins
+/// (`ds` is 100 ms ring-clock ticks, `/10` = seconds), take bin means, keep
+/// consecutive bins under `threshold`, bridge runs separated by at most
+/// `MERGE_GAP_BINS` empty/above bins, and emit one entry per episode.
+/// Pure function; synthetic-tested only.
+fn spo2_low_events(
+    samples: &[(i64, f64)],
+    to_unix: impl Fn(i64) -> f64,
+    threshold: f64,
+) -> Vec<serde_json::Value> {
+    const BIN_DS: i64 = 100; // 10 s of 100 ms ticks
+    const MERGE_GAP_BINS: i64 = 3; // a dip that recovers within 30 s is the same episode
+    // bin -> (sum, count, min)
+    let mut bins: std::collections::BTreeMap<i64, (f64, u32, f64)> = Default::default();
+    for &(ds, v) in samples {
+        let e = bins.entry(ds.div_euclid(BIN_DS)).or_insert((0.0, 0, f64::MAX));
+        e.0 += v;
+        e.1 += 1;
+        e.2 = e.2.min(v);
+    }
+    let mut runs: Vec<(i64, i64, f64)> = vec![]; // (start_bin, end_bin_excl, min_pct)
+    let lows = bins
+        .iter()
+        .filter_map(|(b, e)| (e.0 / (e.1 as f64) < threshold).then(|| (*b, e.2)));
+    for (b, mn) in lows {
+        match runs.last_mut() {
+            Some(last) if b - last.1 <= MERGE_GAP_BINS => {
+                last.1 = b + 1;
+                last.2 = last.2.min(mn);
+            }
+            _ => runs.push((b, b + 1, mn)),
+        }
+    }
+    runs.into_iter()
+        .map(|(s, e, mn)| {
+            json!({
+                "start_s": to_unix(s * BIN_DS).round() as i64,
+                "end_s": to_unix(e * BIN_DS).round() as i64,
+                "duration_s": (e - s) * (BIN_DS / 10),
+                "min_pct": mn.round() as i64,
+            })
+        })
+        .collect()
+}
+
 fn downsample_codes(vals: &[i64], n: usize) -> Vec<i64> {
     if vals.len() <= n {
         return vals.to_vec();
@@ -2653,6 +2702,16 @@ pub fn build_summary(
                 unix_s_at(ds, nt.captured_unix)
             })
         };
+        // SpO2/PI aggregates (kept out of the night_json macro: it is at the json!
+        // recursion limit already)
+        let round0 = |v: f64| v.round();
+        let round2 = |v: f64| (v * 100.0).round() / 100.0;
+        let opt_min = |v: &[f64]| v.iter().cloned().fold(None::<f64>, |a, x| Some(a.map_or(x, |m| m.min(x))));
+        let spo2_min = opt_min(&nt.spo2).map(round0);
+        let perf_vals: Vec<f64> = nt.perf_t.iter().map(|(_, v)| *v).collect();
+        let perf_mean = mean(&perf_vals).map(round2);
+        let perf_min = opt_min(&perf_vals).map(round2);
+        let spo2_low = spo2_low_events(&nt.spo2_t, |ds| unix_s_at(ds, nt.captured_unix), 90.0);
         let span_ds = (nt.end_ds - nt.start_ds).max(1) as f64;
         let temp_span = match (nt.temp_start_ds, nt.temp_end_ds) {
             (Some(start), Some(end)) => Some([
@@ -2737,6 +2796,10 @@ pub fn build_summary(
             "rhr": night_rhr,
             "skin_temp": nightly_skin_temp(&nt.temp).map(|x| (x * 10.0).round() / 10.0),
             "spo2_mean": mean(&nt.spo2).map(|x| x.round()),
+            "spo2_min": spo2_min,
+            "spo2_low_events": spo2_low,
+            "perf_mean": perf_mean,
+            "perf_min": perf_min,
             "deep_pct": deep_pct_val,
             "light_pct": light_pct_val,
             "rem_pct": rem_pct_val,
@@ -3406,6 +3469,39 @@ mod tests {
             ]
         );
         assert!(battery_history(&[], 14).is_empty());
+    }
+
+    // Synthetic fixtures.
+    #[test]
+    fn spo2_low_events_bins_bridges_and_thresholds() {
+        let secs = |ds: i64| ds as f64 / 10.0; // ds is 100 ms ticks
+        let at = |sec: i64, v: f64| (sec * 10, v); // one sample at unix `sec`
+        // (a) empty input -> no events
+        assert!(spo2_low_events(&[], secs, 90.0).is_empty());
+        // (b) one 30 s dip: bins at t=100..129 s below 90, rest above
+        let mut dip: Vec<(i64, f64)> = (0..30).map(|s| at(100 + s, 88.0)).collect();
+        dip.extend((0..10).map(|s| at(60 + s, 97.0)));
+        dip.extend((0..10).map(|s| at(130 + s, 97.0)));
+        let ev = spo2_low_events(&dip, secs, 90.0);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["start_s"], 100);
+        assert_eq!(ev[0]["end_s"], 130);
+        assert_eq!(ev[0]["duration_s"], 30);
+        assert_eq!(ev[0]["min_pct"], 88);
+        // (c) bridge: dips 30 s apart merge; 100 s apart stay separate
+        let mut pair: Vec<(i64, f64)> = (0..10).map(|s| at(100 + s, 85.0)).collect();
+        pair.extend((0..10).map(|s| at(140 + s, 86.5))); // 30 s gap -> same episode
+        let ev = spo2_low_events(&pair, secs, 90.0);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["min_pct"], 85);
+        pair.extend((0..10).map(|s| at(250 + s, 84.0))); // 100 s later -> new episode
+        let ev = spo2_low_events(&pair, secs, 90.0);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["min_pct"], 84);
+        // (d) bin mean at/above threshold never fires, even if a sample dips below
+        let edge: Vec<(i64, f64)> = (0..10).map(|s| at(100 + s, if s == 0 { 89.0 } else { 95.0 }))
+            .collect();
+        assert!(spo2_low_events(&edge, secs, 90.0).is_empty());
     }
 
     #[test]
