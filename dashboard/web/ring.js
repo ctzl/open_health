@@ -357,6 +357,7 @@ function card(ring) {
 async function render() {
   const status = $("rd-status");
   status.textContent = "running…";
+  lastFetch = Date.now() / 1000;
   try {
     const data = await getDiag();
     const rings = data.rings || [];
@@ -372,5 +373,12 @@ async function render() {
   }
 }
 
+let lastFetch = 0;
+
 $("rd-refresh").addEventListener("click", render);
+// Come back from a sync on the main dashboard and this page re-pulls instead of
+// holding the pre-sync state.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && Date.now() / 1000 - lastFetch > 60) render();
+});
 render();

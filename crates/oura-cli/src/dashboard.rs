@@ -2403,21 +2403,35 @@ fn event_tags(conn: &rusqlite::Connection) -> &std::collections::HashMap<String,
 
 /// The scan is minute-scale, so serve the full-list result from a short-lived
 /// cache; the page polls and several viewers shouldn't each pay for it.
+///
+/// The cache is keyed on `db_data_version` (same WAL-aware signal as the summary
+/// cache): a sync commits new events, which changes it, and the next /ring
+/// request recomputes immediately. Without the key a fresh sync stayed invisible
+/// for up to the TTL — observed as "just synced both rings, page shows old
+/// data". The TTL only caps how stale the now-anchored 14-day window can get
+/// while the DB sits untouched, so it stays generous.
 fn ring_diagnostics(db: &Path, only_serial: &str) -> Value {
     if !only_serial.is_empty() {
         return ring_diagnostics_inner(db, only_serial);
     }
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Value)>> =
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, i64, Value)>> =
         std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(9999), Value::Null)));
+    let version = db_data_version(db);
+    let cache = CACHE.get_or_init(|| {
+        std::sync::Mutex::new((
+            std::time::Instant::now() - std::time::Duration::from_secs(9999),
+            i64::MIN,
+            Value::Null,
+        ))
+    });
     if let Ok(g) = cache.lock() {
-        if g.0.elapsed().as_secs() < 300 {
-            return g.1.clone();
+        if g.1 == version && g.0.elapsed().as_secs() < 300 {
+            return g.2.clone();
         }
     }
     let v = ring_diagnostics_inner(db, "");
     if let Ok(mut g) = cache.lock() {
-        *g = (std::time::Instant::now(), v.clone());
+        *g = (std::time::Instant::now(), version, v.clone());
     }
     v
 }
