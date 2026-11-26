@@ -1654,21 +1654,43 @@ function batteryChart(pts) {
 
   const cursor = plot.querySelector(".batt-cursor");
   const svg = plot.querySelector("svg");
+  // A tooltip that follows the cursor. The header readout is easy to miss, and
+  // the point of hovering is the value *at the time under the pointer*.
+  const tip = el("div", "batt-tip");
+  tip.hidden = true;
+  plot.appendChild(tip);
+  const spanOf = (s) => s >= 86400 ? (s / 86400).toFixed(1) + " d"
+    : s >= 3600 ? (s / 3600).toFixed(1) + " h" : Math.max(1, Math.round(s / 60)) + " min";
   const at = (e) => {
     // Measure the SVG, not the .batt-plot wrapper: the wrapper has padding-right
     // for the % labels, and getBoundingClientRect() includes padding, which
     // skews the mapping progressively toward the right edge.
     const r = svg.getBoundingClientRect();
     const t = t0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * span;
-    const p = pts.reduce((a, b) => (Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a));
+    let bi = 0;
+    while (bi < pts.length && pts[bi][0] <= t) bi++;
+    const idx = bi >= pts.length ? pts.length - 1
+      : (bi === 0 ? 0 : (t - pts[bi - 1][0] <= pts[bi][0] - t ? bi - 1 : bi));
+    const p = pts[idx];
     cursor.setAttribute("x1", x(p[0]).toFixed(2));
     cursor.setAttribute("x2", x(p[0]).toFixed(2));
     cursor.style.display = "";
     readout.textContent = `${hhmmOf(p[0])} · ${Math.round(p[1])}%`;
+    const prev = idx > 0 ? pts[idx - 1] : null;
+    tip.innerHTML =
+      `<b>${Math.round(p[1])}%</b>` +
+      `<span>${hhmmOf(p[0])}</span>` +
+      (prev ? `<span>Δ vs previous: ${p[1] - prev[1] >= 0 ? "+" : ""}${Math.round(p[1] - prev[1])}% over ${spanOf(p[0] - prev[0])}</span>` : "");
+    const pr = plot.getBoundingClientRect();
+    let left = e.clientX - pr.left + 12;
+    if (left > pr.width - 190) left = e.clientX - pr.left - 202;
+    tip.style.left = `${Math.max(0, Math.round(left))}px`;
+    tip.style.top = `${Math.round(e.clientY - pr.top - 14)}px`;
+    tip.hidden = false;
   };
   plot.addEventListener("pointermove", at);
   plot.addEventListener("pointerdown", at);
-  plot.addEventListener("pointerleave", () => { cursor.style.display = "none"; readout.textContent = ""; });
+  plot.addEventListener("pointerleave", () => { cursor.style.display = "none"; readout.textContent = ""; tip.hidden = true; });
   return wrap;
 }
 // local-clock helpers for the battery chart's labels (the summary's tz offset)
