@@ -28,6 +28,24 @@ selected by ring hardware type:
 `pi` (perfusion index) is passed to the native algo as a quality input; there is no
 in-app PI threshold. The daily value is clamped to integer **85–100**.
 
+## The dashboard does this natively (Rust)
+
+Since commit `4373a47` the summary pipeline computes the conversion in Rust — no
+Python, no shell-out. `crates/oura-summary/src/lib.rs` (`spo2_pct`) calls the ported
+ecore polynomial with the **gen4/oreo coefficients and the same clamp**:
+
+```rust
+oura_analysis::ported::spo2::spo2_simple(r, 105.2, -5.1, -13.4).clamp(85.0, 100.0)
+```
+
+Every `spo2_r_pi_event` sample is converted as it is folded into the night, and the
+result feeds: the per-night SpO2 lane in the summary series, `spo2_mean` /
+`spo2_min`, low-desaturation episodes below 90% (`spo2_low_events`), and the
+perfusion-index keys (`perf_mean` / `perf_min` and the `perf` lane) taken from the
+same events' decoded `perfusion_index` arrays. Nothing about the coefficients, the
+clamp or the tags changes between the two paths — `tools/run_spo2.py` below is the
+standalone oracle/checker.
+
 **Ring 5 caveat:** its exact hardware→coefficient mapping isn't pinned down in the
 decompiled app (v7.18 predates Ring 5 in that table); the two sets differ by <1% on
 our data, so the result is robust either way. Default is gen4/oreo.
@@ -38,6 +56,7 @@ our data, so the result is robust either way. Default is gen4/oreo.
 python tools/run_spo2.py [DB] [--hw gen4|cooper] [--night]
 ```
 
-One night (26 492 samples, `--night`): mean **93.4%**, median 93%, p5 90%, min 85%
-(clamp floor); ~5% of samples <90%. (A crude generic `110−25·r` gives ~91%, which is
+On a representative night the distribution is **centred in the low 90s** (mean and
+median a few points above 90), with **a few percent of samples below 90%** and a
+floor pinned at the 85% clamp. (A crude generic `110−25·r` gives ~91%, which is
 wrong — use the calibrated quadratic.)

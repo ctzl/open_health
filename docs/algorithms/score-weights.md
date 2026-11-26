@@ -89,7 +89,7 @@ is two contributors whose true inputs the export doesn't expose:
   aren't fully captured by midpoint alone.
 
 Path to exact: compute those two from the **ring's own movement + hypnogram**
-(`sleep_acm_period` / `motion` events + SleepNet staging), which are finer-grained
+(`sleep_acm_period` / `motion` events + the NSSA staging), which are finer-grained
 than the export aggregates — a follow-on that uses ring data, not this CSV.
 
 ## Live scoring from ring data — `oura sleep-score`
@@ -97,8 +97,10 @@ than the export aggregates — a follow-on that uses ring data, not this CSV.
 `tools/score_sleep.py` (and the `oura sleep-score` CLI command) compute a night's
 Sleep Score live, no cloud:
 
-1. SleepNet (`run_sleep_model.py`) → hypnogram → total-sleep / efficiency / REM /
-   deep durations + sleep latency (first sustained-sleep epoch).
+1. Oura's NSSA stager (`tools/nssa_stager.py` `NssaStager`, `sleepstaging_2_6_0.pt`,
+   driven by `tools/run_sleep_model.py`) → hypnogram → total-sleep / efficiency / REM /
+   deep durations + sleep latency (first sustained-sleep epoch). SleepNet
+   (`sleepnet_bdi_0_4_0.pt`) only supplies apnea/SpO₂ here, never the stages.
 2. `bedtime_period` history → real-clock sleep midpoint (from the hypnogram's
    local times) + 7-day regularity (a deciseconds delta, phase-independent).
 3. contributor curves + weights (calibrated from the trends export) → sub-scores →
@@ -106,10 +108,10 @@ Sleep Score live, no cloud:
 
 Restfulness uses only ring-derivable drivers (awake fraction + efficiency); its
 movement micro-inputs aren't reproducible from the export's units and add little
-once awake-fraction is in. Example (latest night in `oura.db`): 471 min asleep,
-91% efficiency → **Sleep Score 82** (Total 83 · Restful 73 · Eff 96 · REM 97 ·
-Deep 40 · Latency 92 · Timing 99). Calibration CSV auto-found at
-`~/Desktop/oura_*trends.csv` or passed with `--csv`.
+once awake-fraction is in. Example: ~8 h asleep,
+~90% efficiency → each contributor curve is evaluated on those inputs and blended by
+the weights above. The calibration CSV is a local Oura trends CSV export (auto-found
+in the default export location) or passed with `--csv`.
 
 ## Readiness & Activity end-to-end (`tools/fit_scores_all.py`)
 

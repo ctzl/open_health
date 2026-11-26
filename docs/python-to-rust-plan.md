@@ -1,5 +1,9 @@
 # Python → Rust port plan (tasks 1 + 2, approved by user 2026-11-23)
 
+**Status: completed.** Tasks 1 and 2 are on `main` — including the dashboard
+wiring (T1e, af16185) and T2c shipped in a different shape (12051ad, see the
+progress log). This document is kept as the port's record, not as open work.
+
 Goal: kill the recurring Python cost in the enrich path. Task 1 = port the four
 uncached model scripts to Rust. Task 2 = port the run_sleep_model.py plumbing.
 Playbook = the ibi-correct one (crates/ibi-correct): golden vectors from the
@@ -9,16 +13,18 @@ Python oracle, bit-exact/f32-mirrored Rust, shim or server wiring, bench.
 
 | script | time | notes |
 |---|---|---|
-| run_sleep_model.py | 169.8 s (121 nights) | cached per-night via nssa_cache.json; ~1.4 s/night cold |
+| run_sleep_model.py | 169.8 s (every recorded night) | cached per-night via nssa_cache.json; ~1.4 s/night cold |
 | run_cva_model.py | 12.8 s | NO cache, full history every run |
 | run_illness_model.py | 10.7 s | NO cache |
 | run_stress_events.py | 7.7 s | NO cache; chains run_stress_model.py subprocess |
 | run_activity_model.py | 5.7 s | NO cache |
 
-`import torch` floor = 2.0 s per script (numpy-only floor = 0.16 s).
-Server runs all five in parallel per dirty summary (dashboard.rs:503-510,
-PythonRunner at dashboard.rs:452, invoked from oura_summary::build_summary at
-dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside it.
+`import torch` floor = 2.0 s per script (numpy-only benchmark floor = 0.16 s).
+The server fans all five out per dirty summary through the `ModelRunner` trait
+(declared in crates/oura-summary/src/lib.rs) — implementations `PythonRunner`
+and `RustRunner` live in crates/oura-cli/src/dashboard.rs, wired from
+`build_summary`. (At plan time only the Python path existed; the Rust runner
+beside it is now the default — see T1e below.)
 
 ## Key facts / code locations
 
@@ -28,8 +34,11 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
   run_stress_model.py). notes/models/ (decrypted), sibling open_oura/notes/models.
 - NO candle precedent (hourly_hr.rs "candles" = chart candles, false lead).
   The real precedent for TorchScript-in-Rust: oura-cli Cargo.toml feature
-  `torch = ["dep:tch"]`, tch 0.22 aligned to venv torch 2.9.0, build.rs rpath
-  comment near line 40-50. Windows: torch DLLs live in
+  `torch = ["dep:tch", "dep:oura-models", "oura-models/torch"]`, tch =0.26.0
+  aligned to venv torch 2.13.0+cpu via a VENDORED torch-sys ([patch.crates-io]
+  → vendor/torch-sys) and .cargo/config.toml (CXXFLAGS=/std:c++20,
+  LIBTORCH_USE_PYTORCH=1) — build with the venv activated; see Pitfalls below.
+  Windows: torch DLLs live in
   .venv/Lib/site-packages/torch/lib (PATH at runtime).
 - astd_event_detection internals are documented in run_stress_events.py
   docstring (classify thresholds ±0.5/±0.4, N=4 bins in 65-min window,
@@ -38,24 +47,30 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
 - cva decode: tag 0x81 delta-stream (0x80 + 3-byte signed24 absolute, else
   int8 delta), runs split at >2 s gaps, 1500-sample segments, rates=50.0,
   demographics [sex, height_m, age, ring_size].
-- run_sleep_model.py hotspots (cProfile, 121 bedtimes, profiler-inflated):
+- run_sleep_model.py hotspots (cProfile, every recorded bedtime, profiler-inflated):
   ring_bedtimes 6.2 s tottime, collect_nssa_inputs 3.3 s + children,
   score_window 3.3 s, row JSON decode 2.2 s, breath_series/_dominant_freq
   2.0 s, correct_ibis 4.0 s (already Rust via persistent worker shim in
   tools/ibi_correction.py — the pattern to copy).
 - Server already has a Rust signal-based fallback stager:
-  oura_summary::stage_nights_from_signals (dashboard.rs:524).
+  `oura_summary::stage_nights_from_signals` (called from `finish_sleep` in
+  crates/oura-cli/src/dashboard.rs).
 - run_sleep_model.py args: `db -5 --json --batch --serial <hex>` (tz is a bare
   float like -5, NOT -05:00), bedtime ranges on stdin (pairs.json format
   [[start,end],...] ring deciseconds).
-- Golden vectors from real DB are OK to commit (precedent:
-  crates/ibi-correct/tests/vectors/real_*.json).
+- Real-DB golden vectors are personal health data and must NOT be committed:
+  they live in gitignored, local-only paths (crates/ibi-correct/tests/vectors/
+  real_*.json, crates/nssa-plumbing/tests/vectors/, crates/oura-models/tests/
+  vectors/) and tests self-skip with `SKIP <test>: <reason>` when a vector is
+  absent (see crates/oura-models/tests/common/mod.rs). Synthetic vectors stay
+  committed.
 
 ## Task 1 — four model scripts → Rust (recurring ~13 s wall per enrich)
 
 1. New crate `crates/oura-models`: one module per model (cva, activity,
    illness, stress), binary subcommand per model emitting the SAME JSON shape
-   as the Python script (server contract = ModelOutputs, dashboard.rs:455-515).
+   as the Python script (server contract = ModelOutputs in
+   crates/oura-cli/src/dashboard.rs).
 2. Capture golden outputs (EXACT commands, run from open_health root, venv
    python; DB = ../open_oura/oura.db, profile.json beside it):
      python tools/run_cva_model.py ../open_oura/oura.db --json      > cva_golden.json
@@ -83,8 +98,8 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
    boundaries).
 3. Shim: Python calls a persistent Rust worker over JSON stdio (copy
    tools/ibi_correction.py _rust_worker pattern).
-4. Golden vectors: capture collect_nssa_inputs + score_window outputs for the
-   121 real-DB bedtimes from the real DB; require bit-exact.
+4. Golden vectors: capture collect_nssa_inputs + score_window outputs for every
+   recorded real-DB bedtime from the real DB; require bit-exact.
 5. Bench cold full run: target 170 s → ~60 s (plumbing only; torch inference
    stays Python).
 
@@ -105,7 +120,7 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
       absolute idx (2,4,5,6) -> every slot shifted. Golden MUST be captured
       with `-5 --json --serial ...` (matches the test's oracle_args()).
 - [x] T1b stress: DONE + parent-verified 2026-11-23 (26/26 tests; byte-identical
-      to oracle incl. 4 real stress events). Parent switched test+golden to
+      to oracle incl. the recorded stress events). Parent switched test+golden to
       `--tz -5 --serial <ring-serial>` (no-serial capture had ZERO events —
       multi-ring mixing kills DSA; serial config exercises the event path) and
       fixed the shape guard (looked for event keys at day level, not in
@@ -122,17 +137,17 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
       offset) and gated the probe test: torch build runs --no-stepmotion to
       match the gait-stubbed probe; packet-collection asserts run non-torch
       only. Note: #[cfg] on expressions is unstable — use cfg!() in tests.
-- [x] T1c re-verified 2026-11-24: the "golden 47 vs rust 29" gap was a stale
-      comparison, not a port bug — 47 is the *all-serials* count from the Nov 23
-      DB state (it survives in hermes/cache/scratch/sidecar_bak/
-      activity.all.units.json); the ring-B golden command (`--tz -5 --full
-      --serial <ring-serial>`) yields 29 on today's DB and Rust reproduces
-      those byte-for-byte. Fresh captures, 0 diffs everywhere (count, order,
-      labels, durations): ring B 29/29 — including the dashboard's default args
-      (no --full) — both rings 55/55, ring A 33/33. Timings: full history
+- [x] T1c re-verified 2026-11-24: the apparent session-count gap between the
+      Nov 23 golden and the Rust output was a stale comparison, not a port bug —
+      the old count came from an *all-serials* run of that day's DB state (it
+      survives in a local cache copy of the sidecar output); the single-ring
+      golden command (`--tz -5 --full --serial <ring-serial>`) is reproduced
+      byte-for-byte on today's DB. Fresh captures, 0 diffs everywhere (count,
+      order, labels, durations): all sessions for both rings matched, including
+      the dashboard's default args (no --full). Timings: full history
       Python 54.0 s vs Rust 16.9 s; default window 26.3 s vs 15.8 s.
       DATA DRIFT, not code: these goldens are snapshots of a syncing DB.
-      Re-captured activity ORACLE_JSON + its `ran` count (38->39) because the
+      Re-captured activity ORACLE_JSON (its `ran` day count moved) because the
       ring gained 2 clock anchors since Nov 23 ([1,230,5] -> [1,232,5]), and
       re-captured illness_golden.json (anchor day 2026-11-23 -> 2026-11-24; the
       Rust output was token-identical to a fresh Python run, so the vector was
@@ -142,7 +157,7 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
       50 tests (lib 8 + activity 10 + cva 4 + illness 2 + stress 26), with and
       without --features torch.
 - [x] T1c-inc incremental activity: DONE + parent-verified 2026-11-24
-      (crates/oura-models/src/activity_incremental.rs + tests/
+      (crates/oura-models/src/incremental.rs + tests/
       activity_incremental_test.rs, 10/10; full suite 60/0 both feature
       configs). Mirrors Python's sidecar cache (model_state/activity/
       units.json): day-level fingerprint invalidation, per-day state
@@ -165,18 +180,28 @@ dashboard.rs:585). ModelRunner trait exists — implement a Rust runner beside i
       2026-11-24). Guard demo verified: perturbed constants -> both
       binaries short-circuit (25.6 s -> 0.06 s, 24.7 s -> 0.52 s), 0 failed.
 - [x] T2: DONE + parent-verified 2026-11-24 (cargo test -p nssa-plumbing
-      --release 21/21: 16 unit + 5 golden; all 121 nights bit-exact for
-      is_dated/ring_bedtimes/collect_nssa_inputs/breath_series (30,238
-      windows)/score_window). np.mean rule pinned empirically (numpy 2.2.6):
+      --release 21/21: 16 unit + 5 golden; every recorded night bit-exact for
+      is_dated/ring_bedtimes/collect_nssa_inputs/breath_series/score_window
+      over the full event history). np.mean rule pinned empirically (numpy 2.2.6):
       true divide by n; add.reduce buffers >8192 (left-to-right sum of
       per-8192 pairwise sums); DOUBLE_pairwise_sum = 8 accumulators a[0..8]
       strided by 8, ((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7)) + one-at-a-time n%8
       tail, split at n/2 rounded DOWN to multiple of 8, n<8 naive from -0.0.
-      Locked by unit test with hex bit patterns. Timings 121-night plumbing:
+      Locked by unit test with hex bit patterns. Timings, full-history
+      plumbing:
       Python 12.37 s vs Rust 5.13 s (collect 3.2x; breath 0.83x slower —
       scalar ddot is the price of bit-exactness; it's 1.5 s of 170 s).
-- [ ] T1e: RustRunner wiring in dashboard.rs + fallback + benches + commit (me, after ports)
-- [ ] T2c: shim wiring into run_sleep_model.py + bench + commit (me, after T2)
+- [x] T1e: DONE — commit af16185 "dashboard: run models in-process via
+      oura-models (torch), Python fallback". dashboard.rs `build_summary` now
+      defaults to a `RustRunner` (with an `OURA_DASHBOARD_PYTHON=1` escape
+      hatch back to Python), each model falls back to its Python runner on any
+      Rust error, and the incremental bench lives at
+      crates/oura-models/examples/activity_incremental_bench.rs.
+- [x] T2c: SHIPPED IN A DIFFERENT SHAPE — commit 12051ad "T2c: serve sleep
+      windows from nssa_cache.json in Rust". No shim was added to
+      run_sleep_model.py; instead dashboard.rs `sleep_batch_cached` answers
+      sleep windows in-process via `nssa_plumbing::cache` and delegates only
+      cache misses to tools/run_sleep_model.py.
 
 ## Pitfalls
 

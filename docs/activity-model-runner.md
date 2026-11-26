@@ -1,15 +1,19 @@
 # Running Oura's activity-detection model on our data
 
 `tools/run_activity_model.py` feeds our stored ring events into Oura's decrypted
-TorchScript `automatic_activity_detection_3_1_11.pt` and prints detected activity
-segments — **no raw IMU / RData needed**, it runs on the windowed signals we
-already sync.
+TorchScript activity model — the newest `automatic_activity_detection_3_1_*.pt`
+found in `notes/models/` — and prints detected activity segments — **no raw IMU /
+RData needed**, it runs on the windowed signals we already sync. The filename is
+never pinned: the asset set rotates with every app version, and the runner detects
+its calling convention from the loaded schema.
 
-**This is the engine behind `oura sessions`.** The Rust CLI no longer ships a
-temperature/MET heuristic; `oura sessions` shells out to this script (it locates
-the repo's `.venv/bin/python`, falling back to `python3`). Use the CLI for the
-normal path and this script directly for `--json`, `--verbose`, or a custom
-`--threshold`/`--min-duration`.
+**This is the reference implementation of the activity engine.** With a
+`--features torch` build, `oura sessions` and the dashboard run the same model
+**in-process in Rust** (see below); only non-torch builds shell out to this
+script (the interpreter probe checks `.venv/bin/python`,
+`.venv/Scripts/python.exe`, and the sibling `open_oura` venvs before falling
+back to `python3`). Use the CLI for the normal path and this script directly for
+`--json`, `--verbose`, or a custom `--threshold`/`--min-duration`.
 
 ```
 python tools/run_activity_model.py [DB] [--tz HOURS] [--threshold P] [--date YYYY-MM-DD] [--json]
@@ -20,14 +24,40 @@ fine) in the venv. The model lives in `notes/models/`.
 
 ## In-process (Rust + LibTorch, no Python at runtime)
 
-Built with `--features torch`, `oura sessions` can run the base model in-process via
-the `tch` crate. That legacy path does not yet run `steps_motion_decoder`; use the
-default Python-backed command (and the web dashboard, which uses it) for the
-Android-parity labels documented here.
+Built with `--features torch`, `oura sessions` and the web dashboard run the
+model **in-process** via the `tch` crate (`crates/oura-models/src/activity.rs`).
+Under that feature **both TorchScript calls are live**: the AAD CModule's
+`forward_is` *and* the `steps_motion_decoder` gait decoder — the same
+Android-parity labels documented here, no Python at runtime. (The dashboard
+defaults to this Rust path, with a per-model Python fallback and an
+`OURA_DASHBOARD_PYTHON=1` escape hatch.) Only the legacy `oura-cli` path
+(`crates/oura-cli/src/activity_model.rs`) still stubs stepmotion with NaN
+features; non-torch builds keep using the Python runner.
 
-On Apple Silicon the only libtorch is the pip wheel, so the repo **venv is aligned
-to torch 2.9.0** (Python 3.11) — the exact version `tch 0.22` targets — and we link
-against it with **no version-check bypass**:
+The repo links against **its own venv's torch** rather than a system libtorch,
+with **no version-check bypass**. Current alignment (the fragile part of the
+build — keep all of it in lockstep):
+
+- `tch =0.26.0` (crates/oura-cli + crates/oura-models) ↔ **torch 2.13.0+cpu**
+  in the venv (Python 3.10.6);
+- a **vendored torch-sys** via `[patch.crates-io]` (`vendor/torch-sys`: the
+  libtch typedef `module` is renamed `tch_module` because MSVC C++20 reserves
+  `module`, and torch ≥2.10 headers need C++20 even though tch 0.26 passes
+  `/std:c++17`);
+- `.cargo/config.toml` sets `CXXFLAGS=/std:c++20` and `LIBTORCH_USE_PYTORCH=1`.
+
+Windows (the repo's current host) — activate the venv before building, or cargo
+can't find torch's DLLs via python discovery:
+
+```
+.venv\Scripts\activate
+cargo build --features torch
+# at runtime the torch DLL dir must be on PATH:
+#   .venv\Lib\site-packages\torch\lib   (run-dashboard.ps1 does this)
+```
+
+On macOS the only libtorch is likewise the pip wheel; there `build.rs` embeds
+the venv torch `lib/` as an rpath instead of using PATH:
 
 ```
 export PATH="$PWD/.venv/bin:$PATH"
@@ -36,18 +66,20 @@ cargo build --features torch
 oura sessions --tz-offset 1     # no DYLD_LIBRARY_PATH needed — build.rs bakes the rpath
 ```
 
-`build.rs` embeds the venv torch `lib/` as an rpath, so the binary loads
-`libtorch_*.dylib` without `DYLD_LIBRARY_PATH`. The default build (no feature)
-needs no libtorch and keeps using the Python runner. Note LibTorch prints a
-one-time `searchsorted` perf warning to stderr (harmless; stdout/JSON stay clean).
+The default build (no feature) needs no libtorch and keeps using the Python
+runner. Note LibTorch prints a one-time `searchsorted` perf warning to stderr
+(harmless; stdout/JSON stay clean).
 
-Version coupling: `tch X` pins one exact libtorch (0.20→2.7, 0.22→2.9, 0.24→2.11);
-there is **no 2.8 release**. The venv torch must match the `tch` pin, and torch
-≥2.9 needs Python ≥3.10. If you bump either, bump both together.
+Version coupling: `tch X` pins one exact libtorch (0.20→2.7, 0.22→2.9,
+0.24→2.11, **0.26→2.13** ← the current pin). tch 0.27 needs torch 2.15, for
+which there is no cp310 wheel, so it's not an option for this venv. `tch` and
+`torch-sys` share the `links = "tch"` key: if you bump one, bump both together.
 
 ## Android parity
 
-The decompiled Android app uses this same 3.1.11 model. Its important preprocessing
+The decompiled Android app ships the same model family; the runner is
+version-agnostic (newest `3_1_*` asset) and detects the calling convention from
+the loaded schema. Its important preprocessing
 steps are now mirrored here and in iOS:
 
 - one inference per local calendar day; model time is minutes since local midnight;
@@ -56,13 +88,13 @@ steps are now mirrored here and in iOS:
 - the decoder's columns reordered through Android's `StepMotionFeature` schema.
 
 The ring exposes the decoder input directly as paired `real_step` events (0x7e/0x7f),
-so raw RData is not required. On a retained Ring 5 replay this changes a known hike
-from `cycling` 0.45 to `hiking` 0.97, while a known bike remains `cycling` 0.92 and
-an immersion interval is classified `swimming` 0.99.
+so raw RData is not required. On a retained replay, real sessions relabel correctly:
+a hike flips from `cycling` to `hiking`, and an immersion interval becomes
+`swimming`.
 
 ## Days the model cannot evaluate
 
-Two input shapes make AAD 3.1.11 throw inside its preprocessor instead of returning no
+Two input shapes make AAD throw inside its preprocessor instead of returning no
 workouts, so both runners (`tools/run_activity_model.py` and iOS `ActivityModel`) guard
 them identically:
 
@@ -82,9 +114,18 @@ skipped, so one bad day never blocks the rest of the history or reruns on every 
 
 ## I/O contract (as implemented)
 
-forward args (TorchScript order): `context, user, met, stepmotion, motion,
-temperature, heartrate, location=None, past_activities=None, probability_threshold,
-minimum_duration_minutes, allow_non_wear`.
+Leading forward args (TorchScript order): `context, user, met, stepmotion,
+motion, temperature, heartrate, location=None, past_activities=None`. The
+trailing settings args depend on the loaded model generation, and both runners
+detect the schema (`global_settings` in the forward signature) instead of
+pinning a version:
+
+- **AAD ≤3.1.12**: three scalar tensors positionally — `probability_threshold,
+  minimum_duration_minutes, allow_non_wear`.
+- **AAD 3.1.15**: one optional `global_settings` 72-column row read by column —
+  col 3 `allow_non_wear`, col 12 is_workout probability threshold, col 26
+  min workout duration; NaN falls back to the model's baked-in default, so only
+  the three known slots are set.
 
 All series are float32 2-D, **column 0 = time in minutes** on one shared axis.
 

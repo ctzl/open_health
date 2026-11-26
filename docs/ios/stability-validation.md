@@ -42,16 +42,24 @@ Run Rust tests:
 cargo test -p oura-core -p oura-store -p oura-summary --lib
 ```
 
+That command currently runs **106 lib tests** across those crates (78 in `oura-summary`, 15 in
+`oura-core`, 13 in the vendored `oura-store`). The counts grow with every regression test;
+treat them as a "this build was green at this date" note, not a fixed target.
+
 Rebuild the matching FFI library, Swift and headers:
 
 ```sh
 bash apps/ios/build-xcframework.sh
 ```
 
-Generate with `project.yml` for models or `project-ci.yml` for model-free builds,
-then run the OuraApp scheme's tests on an arm64 iPhone simulator. Both specs
-include OuraAppTests. The model-enabled build requires the existing local Torch
+Generate with `project.yml` for models or `project-ci.yml` for model-free builds (both live in
+`apps/ios/OuraApp/`), then run the OuraApp scheme's tests on an arm64 iPhone simulator. Both
+specs include OuraAppTests. The model-enabled build requires the existing local Torch
 frameworks and model resources documented in the iOS build instructions.
+
+The Swift suite is now **56 tests across five specs**: `StabilityTests` (37),
+`NssaParityTests` (8), `NssaCacheTests` (5), `HealthExportTests` (4), `ResearchExportTests` (2).
+Like the Rust count above, that is a dated inventory of what the specs contain, not a target.
 
 Tests cover transaction rollback on failed insert or checkpoint, idempotent
 replay, read-only opening, Rust cancellation during authentication, SQLite error
@@ -97,10 +105,14 @@ history. The overall 50% memory-reduction target and long-history numerical pari
 remain device/data acceptance criteria, distinct from the synthetic reader result.
 Keep matching Release dSYMs with any distributed build. No release was published.
 
-## Results for this checkout
+## Results
 
-- 29 Rust tests passed (5 FFI/core, 8 storage, 16 summary).
-- 8 model-enabled simulator tests passed on iPhone 17 Pro / iOS 26.5.
+### Recorded at build 26 (the run this document describes)
+
+- 29 Rust tests passed (5 FFI/core, 8 storage, 16 summary) — the suite size **at the time of
+  this run**; it has grown since, see below.
+- 8 model-enabled simulator tests passed on iPhone 17 Pro / iOS 26.5 — again the spec count
+  at that time, not the current one.
 - Model-free simulator build and model-enabled Release device build succeeded.
 - Device app and dSYM UUIDs match: `64C44406-A317-3D7C-8969-8516DF3822A8`.
 - Device executable links `/usr/lib/libsqlite3.dylib`; the rebuilt Rust iOS
@@ -110,3 +122,12 @@ Keep matching Release dSYMs with any distributed build. No release was published
 The unsigned app, matching dSYM, test summary and build/benchmark logs are in
 `local/validation/build26/` (gitignored). The paired iPhone was unavailable, so
 physical ring tests and whole-app memory acceptance have not been performed.
+
+### Current counts in this checkout (November 2026)
+
+- `cargo test -p oura-core -p oura-store -p oura-summary --lib`: **106 passed, 0 failed**
+  (78 `oura-summary` / 15 `oura-core` / 13 vendored `oura-store`).
+- The iOS specs declare **56 tests** (`StabilityTests` 37, `NssaParityTests` 8,
+  `NssaCacheTests` 5, `HealthExportTests` 4, `ResearchExportTests` 2). They were not executed
+  from this host — running them still needs an arm64 iPhone simulator, so treat this as a
+  declared-count inventory, not a passing result.

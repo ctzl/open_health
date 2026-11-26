@@ -26,7 +26,7 @@ The gap was **accumulated local state**, plus one app/account setting:
 ```
 oura sync                      # raw events → oura.db (nightly)
 tools/calibrate_scores.py      # trends export → local/score_params.json   (one-time / per export)
-tools/build_daily.py           # per night: SleepNet + HRV/RHR/recovery/temp/MET → daily_summary + baselines
+tools/build_daily.py           # per night: hypnogram (NSSA, via score_sleep.py) + HRV/RHR/recovery/temp/MET → daily_summary + baselines
 tools/score_readiness.py       # daily_summary + baselines + params → Readiness Score
 ```
 
@@ -63,16 +63,20 @@ The baseline-relative contributors compare today to a personal ~14-day baseline.
 fewer days the baseline is **cold** (falls back to the current value → neutral
 deviation) and the Readiness number is **provisional** — the scorer flags each cold
 contributor and prints how many days of history exist. After ~2 weeks of nightly sync
-they mature and Readiness becomes as live as Sleep. Example on 6 days of history:
+they mature and Readiness becomes as live as Sleep. Output shape on a 6-day toy
+history (illustrative placeholders):
 
 ```
 Readiness Score … history 6 day(s)  ⚠ baselines still maturing (<14d) — provisional
-  inputs: HRV 111/92ms  RHR 34/35.6bpm  recovery 3.17h  tempΔ +0.23°C
+  inputs: today vs baseline HRV / RHR / recovery hours / temperature deviation
   Resting Heart Rate Score   17%  100  17.0 ~baseline-cold
   HRV Balance Score          15%   82  12.4 ~baseline-cold
   …
-  READINESS SCORE                          76
+  READINESS SCORE                          <total>
 ```
+
+Each contributor line prints weight, sub-score and weighted contribution; the
+baseline-relative ones carry the `~baseline-cold` tag until enough history exists.
 
 ## What's still gated
 

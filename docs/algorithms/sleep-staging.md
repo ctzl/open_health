@@ -53,7 +53,7 @@ Correction init: at most 4 outputs per call, max gap 5000 ms, HR mode, max HR 15
 | --- | --- | --- |
 | 1 | `sleepnet_moonstone_1_2_0` stages (tools/run_sleep_model.py, iOS SleepStaging.swift) | `sleepstaging_2_6_0` (NSSA). Its five custom ops are now implemented. |
 | 2 | Motion input = `motion_seconds` from 0x47 | 0x72 `sleep_acm_period`: one 30 s window, six statistics in the column order above. Our decoder also labelled all six `acm_mad` and rounded them to 4 decimals. |
-| 3 | IBI validity = 300–2000 ms plus a "tail noise" heuristic; 0x80 beats merged in; beats synthesized from 0x5D when IBI was missing | 0x60 only, corrected by ecore. On 2026-10-15 ecore flags 1,202 of 23,178 beats invalid and refills 660; the old rule accepted all of them. |
+| 3 | IBI validity = 300–2000 ms plus a "tail noise" heuristic; 0x80 beats merged in; beats synthesized from 0x5D when IBI was missing | 0x60 only, corrected by ecore. On a real night ecore flagged roughly 5 % of the beats invalid and refilled a few hundred gaps; the old rule accepted all of them. |
 | 4 | Beat k stamped event time + cumulative IBI (about one packet, ~5 s, too late), no clamping | Event time − IBIs that follow, clamped to be non-decreasing. |
 | 5 | Temperature = mean of each 0x75 event at the event time, or 0x46 as a fallback | Every 0x75 sample, 30 s apart. 0x46 is never used. |
 | 6 | Inputs taken from ±10 min around the window; window = the summary's extended or merged night | Exactly the ring bedtime(s) inside the night, each staged separately. |
@@ -74,7 +74,7 @@ The fixtures are synthetic. Personal ring data stays local.
   - Exported blob vs the lifter: 3000/3000.
   - C vs numpy: `tools/test_nssa_ops.py`.
 - **IBI correction**: the Python port matches emulated libappecore on the real night and on 160 synthetic streams.
-- **0x60 decoder**: identical to the native decoder on all 106,797 rows.
+- **0x60 decoder**: identical to the native decoder across the full captured night.
 - **Ops**
   - Biquad step: emulated, 60,000 fuzz cases bit-exact.
   - The other three ops: transcribed and cross-checked by reading the code.

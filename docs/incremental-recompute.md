@@ -1,10 +1,13 @@
 # Incremental model recompute
 
-Status: implemented on `explore/rust-models` for the activity runner
-(`tools/event_cache.py` + `run_activity_model.py`); other runners adopt the
-same primitives. Motivation: every model runner re-reads and re-derives the
-whole history on every dashboard sync. Cost grows linearly forever; the
-user's data grows daily.
+Status: **implemented on `main`** and shipped as the default: the Rust port
+(`crates/oura-models/src/incremental.rs`) is the path the dashboard calls; the
+original Python version (`tools/event_cache.py` + `run_activity_model.py`) is
+still present but is not the shipped engine. So far **only the activity runner
+has an incremental path** — cva/illness/stress still re-read the whole history
+per run; no other runner has adopted these primitives. Motivation: every model
+runner re-reads and re-derives the whole history on every dashboard sync. Cost
+grows linearly forever; the user's data grows daily.
 
 ## Ground truth that makes this safe
 
@@ -25,12 +28,19 @@ Per model key + serial, sidecars next to the db:
 1. `<model>.<serial>.inc.json` — run state: `watermark` (MAX(id) of the
    runner's WHERE set), the built `epochs`, and per-boot `anchor_fp`
    (anchor count + max ds).
-2. `<model>.<serial>.<where-hash>.skel.pkl` — the cheap columns
+2. `<model>.<serial>.<where-hash>.skel.json` — the cheap columns
    (`ds, tag, anchor payload, captured`) that `build_epochs` needs, with its
    own watermark so a run killed before `commit()` cannot double-append.
 3. `<model>.<serial>.units.json` — per-day model results, valid while
    `settings_fp` (model asset hash + runner args + profile demographics +
    STATE_VERSION) holds.
+
+The two engines keep separate, non-colliding caches: the live **Rust path**
+namespaces its model keys with `.rs.` (`activity.rs.<serial>.inc.json`),
+writes the skeleton as JSON (the pickle is not parseable from Rust), and
+hashes the WHERE clause with **FNV-1a-64**. The Python path keeps
+`.skel.pkl` skeletons and a `sha256[:12]` where-hash, so the two never share
+state.
 
 Warm run (`run_incremental`):
 
@@ -69,14 +79,25 @@ Warm run (`run_incremental`):
 | model asset rotated | model hash in `settings_fp` → full recompute |
 | code/contract change | `STATE_VERSION` bump → full recompute |
 
-## Measured (1.9 M events, 201 days, activity runner)
+## Measured (activity runner)
 
-| run | before | after |
+The runs below were recorded at different times against a growing DB, so treat
+them as ratios, not one benchmark run. Current engines, full event history:
+
+| run | Python runner | Rust runner (shipped) |
 |---|---|---|
-| cold / `--full` | 32 s | 32 s |
-| warm, nothing new | 32 s | 2.4 s |
-| warm, signal sync | 32 s | 8.4 s |
-| warm, time-sync anchor | 32 s | 9.7 s |
+| full history (`--full`) | 54.0 s | 16.9 s |
+| default window (dashboard args) | 26.3 s | 15.8 s |
+| full run, incremental-verification session | 11.0 s | 17.7 s |
+| warm incremental re-run (same session) | — | ~2.1 s |
+
+First live dashboard run after a sync logged `activity (rust): 12583 ms`
+(cold path over the full decoded history); subsequent warm runs are ~2 s.
+
+Historical: the original Python-era before/after (before the Rust port, at an
+earlier DB scale) was cold 32 s → warm 2.4–9.7 s across scenarios (nothing
+new / signal sync / time-sync anchor). Different engine and scale — do not
+compare against the table above.
 
 Warm output is byte-identical to `--full` in every scenario. `--date` forces
 one day and matches the full output for that day.
@@ -86,4 +107,5 @@ one day and matches the full output for that day.
 1. cold run → JSON A; 2. warm run → JSON B, `cmp A B` empty; 3. simulate a
    sync (insert signal rows / a new anchor) → warm JSON C vs `--full` JSON D,
    `cmp C D` empty; 4. `--date` one day vs that day's slice of D.
-Unit tests for the primitives live in `tools/test_event_cache.py`.
+   Unit tests for the primitives live in `tools/test_event_cache.py` (Python) and
+   `crates/oura-models/tests/activity_incremental_test.rs` (Rust port).

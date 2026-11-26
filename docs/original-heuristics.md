@@ -9,7 +9,11 @@ MET, motion, skin temperature and HR.
 `automatic_activity_detection` model instead of our heuristic — see
 [`activity-model-runner.md`](activity-model-runner.md). The `oura sessions`
 command shells out to `tools/run_activity_model.py`, which returns the model's
-segment times, workout probability, and activity-type label.
+segment times, workout probability, and activity-type label. A build with
+`--features torch` instead runs the ported model **in-process** via LibTorch
+(`crates/oura-cli/src/activity_model.rs`; the same feature flag is what enables
+the dashboard's `RustRunner`); default (non-torch) builds still shell out to the
+Python runner.
 
 Why the switch: the heuristic classified purely by temperature, so it mislabeled
 a morning run as a "Swim" (the ring's skin-temperature reading tripped the

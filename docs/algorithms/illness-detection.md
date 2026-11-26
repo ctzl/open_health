@@ -101,7 +101,7 @@ longest sleep, but `sedentary_time` / `resting_time` at the same position are th
 `symptomradar/model/a.smali`, method `a(...)`, ~l.788-835; the DB query window starts
 30 days back for that reason). So index 0 = last night's sleep + yesterday's full day of
 activity. Feeding the wake day's partial morning instead (≈0 sedentary) shifts the score
-by 0.1-0.4 on real data.
+slightly in practice.
 
 **Missing days:** encode as `NaN`. `_normalize` maps NaN (and out-of-range) to 0.5 after
 scaling; a separate NaN-mask channel is fed to the network; `nanmean`/`nanstd` skip NaN
@@ -199,9 +199,9 @@ surfaced as symptom cards (`BiometricType` = `AverageBreath, LowestHeartRate, Av
 TemperatureDeviation` — `de0/b.java`); avg HR, sedentary and resting time are computed but
 not shown as symptoms.
 
-Empirically confirmed sign behavior: lowest-HR today 70 (baseline 51.1-58.9) → flagged
-ELEVATED; today 40 → **not** flagged (one-sided high); HRV today 20 → flagged DECREASED;
-temp-dev today 1.0 (±0.2) → flagged ELEVATED; breath deviating either way → flagged.
+**Sign behaviour — worked example:** lowest-HR today 70 against a
+baseline band around 51–59 → flagged ELEVATED; today 40 → **not** flagged (one-sided high); HRV today 20 →
+flagged DECREASED; temp-dev today 1.0 against ±0.2 → flagged ELEVATED; breath deviating either way → flagged.
 
 ---
 

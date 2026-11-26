@@ -52,10 +52,16 @@ per-ring via rings.auth_key_hex); sharing one profile across rings.
 - `POST /api/blood/assign` body `{sha, serial}`.
 - `GET /api/dna/files?serial=` → entries carry `serial`; filtering is
   client-side so the assign UI can show everything.
-- Startup auto-import: import into the **primary ring** (first from
-  `list_rings()`) — see §5.
-- Serial resolution helper: `?serial=` param wins, else `ouradash_ring`
-  cookie (name in app.js `RING_COOKIE`), else None.
+- Startup does **not** import documents. It only backfills legacy `serial=''`
+  blood rows onto the primary ring and migrates/creates the per-profile
+  document dirs (§5, §9). Auto-import is **lazy**: the first
+  `GET /api/blood/report` scans that profile's document dir, and only when the
+  blood DB holds nothing at all (`blood.rs` `report_from_dir`) — never
+  per-profile-per-request, so an empty profile doesn't rescan on every load.
+- Active-profile state is **client-side only**: it lives in the `oura_ring`
+  cookie (`RING_COOKIE` in `app.js`, `PROFILE_COOKIE` in `profile.js`), which
+  the pages attach as `?serial=`. The server resolves only the `?serial=`
+  query (unique serial prefixes accepted); it never reads cookies or sessions.
 
 ### 3.4 Demographics ("Your details") — per-profile
 Age / sex / height / weight / ring size feed the CVA (and other) models, so
@@ -75,10 +81,15 @@ their own. Legacy single-object files are migrated to `{ "": {...} }` on read.
   ring-scoped) and `saveProfile` stamps `serial: CURRENT_SERIAL`.
 
 ## 4. Frontend (`dashboard/web/`)
-- Share the existing switcher pattern from `app.js` (lines ~2317-2370):
-  same `RING_COOKIE` cookie so the choice is ONE state across all pages.
-  Extract or copy `loadRings/selectRing/renderSwitcher` into `blood.js`
-  and `dna.js` (copy is fine; keep the cookie name + `ringQS()` shape).
+- Share the existing switcher pattern in `app.js` (`RING_COOKIE`,
+  `readRingCookie`, `fetchRings`, `selectRing`, `updateRingButton`, `ringQS` —
+  refer to symbols, not line numbers, which drift): same `oura_ring` cookie so
+  the choice is ONE state across all pages. Extract or copy those into
+  `blood.js` and `dna.js` (copy is fine; keep the cookie name + `ringQS()`
+  shape).
+  **Superseded:** what shipped is one shared `profile.js`
+  (`PROFILE_COOKIE`, `profileQS`, `profileUrl`, `initProfileSwitcher`) instead
+  of copies in `blood.js`/`dna.js` — see §8.
 - `blood.html/js`: switcher at top; every fetch carries `&serial=`;
   per-import row gets a profile `<select>` (calls /api/blood/assign);
   import button imports into the ACTIVE profile.
@@ -87,20 +98,26 @@ their own. Legacy single-object files are migrated to `{ "": {...} }` on read.
 - `app.js`: relabel switcher "Profile" (it already scopes ring data).
 
 ## 5. Migration of existing data (one-time, at dashboard startup)
-- If `list_rings()` is non-empty and any `imports.serial=''` exist:
-  `UPDATE imports SET serial=<primary> WHERE serial=''` where primary =
-  first ring from `list_rings()` (the user's own ring). Log it.
+- If rings are registered and any `imports.serial=''` exist:
+  `UPDATE imports SET serial=<primary> WHERE serial=''` where **primary = the
+  ring with the smallest `added_unix`** (the first one ever paired), chosen
+  explicitly in the `serve()` migration block in
+  `crates/oura-cli/src/dashboard.rs`. Do NOT take `list_rings()[0]`: that
+  listing is ordered **most-recently-active first**, so its head would move
+  whenever the secondary ring syncs. Log it.
 - Unassigned DNA files: NOT backfilled — shown under all profiles with an
   assign control (wife's genome must be assigned explicitly).
-- Current state to migrate: 4 blood imports (all user's), 1 VCF in
-  dna/files (user's) — verify actual list at implementation time.
+- Current state to migrate: the pre-existing blood imports and VCFs in the
+  single-user setup (all belonging to the ring owner) — count them at
+  implementation time rather than hard-coding a number.
 
 ## 6. Acceptance tests
-1. Fresh build; startup backfills 4 imports to primary ring;
-   `GET /api/blood/report?serial=<primary>` → 4 reports;
-   `?serial=<wife>` → 0 reports.
-2. `POST /api/blood/assign {sha, serial:<wife>}` moves one report;
-   counts flip 3/1.
+1. Fresh build; startup backfills the legacy `serial=''` imports onto the
+   primary ring; `GET /api/blood/report?serial=<primary>` shows every report,
+   `?serial=<other>` shows none.
+2. `POST /api/blood/assign {sha, serial:<other>}` moves one report; the two
+   profile counts flip accordingly (one leaves the primary, one appears on the
+   other).
 3. Import with `{serial:<wife>}` tags new rows.
 4. `/api/dna/files` entries carry serial; assign persists across restart.
 5. Browser: switch profile on /, then /blood and /dna show that person
@@ -134,15 +151,17 @@ their own. Legacy single-object files are migrated to `{ "": {...} }` on read.
 - Blood rows show a per-report profile `<select>` only when ≥2 rings are
   registered; `POST /api/blood/assign` takes the 12-char sha prefix shown
   in the report JSON (`WHERE sha LIKE ?1 || '%'`).
-- Legacy backfill ran: 4 blood imports → primary ring ("Daily ring",
-  serial 40160B25…). Verified: primary sees 4, other ring sees 0;
+- Legacy backfill ran: the pre-existing blood imports → the **primary ring**
+  (by `added_unix`, not by nickname or by `list_rings()` order). Verified: the
+  primary sees all of them, the other ring sees none;
   assign/revert round-trips both stores; unassigned VCF visible to all.
 - Main dashboard switcher relabeled "Profile" (index.html); behavior
   unchanged.
 
 ## 9. Per-profile blood document directories (added after §8)
-- Layout: `<blood_dir>/<ring-serial>/*.pdf` (e.g.
-  `Documents/official/health/40160B2500000001/`). `blood.db` stays at the
+- Layout: `<blood_dir>/<ring-serial>/*.pdf` (e.g. the default health dir
+  plus a ring serial, `<documents>/health/50380B2600000001/` — that serial is
+  a synthetic example). `blood.db` stays at the
   root. Rationale: the wife's lab PDFs don't carry the `blood ` filename
   prefix, and a shared flat folder forced prefix hacks; inside a profile
   directory **any** `*.pdf` belongs to that person.
@@ -151,7 +170,9 @@ their own. Legacy single-object files are migrated to `{ "": {...} }` on read.
   the root and keep the legacy `blood *.pdf` scan filter.
 - **Import** (`POST /api/blood/import-dir`) scans the active profile's dir
   (created on demand); the first-run auto-import in `GET /api/blood/report`
-  scans the requested profile's dir. Root/legacy behavior unchanged.
+  scans the requested profile's dir, and only when the blood DB holds no rows
+  at all (`blood.rs` `report_from_dir`) — consistent with §3.3: startup never
+  imports. Root/legacy behavior unchanged.
 - **Assign moves the file too**: `POST /api/blood/assign` updates the DB
   row *and* renames the PDF into the target profile's dir (unassign →
   root), updating the stored path. A failed file move doesn't roll back the

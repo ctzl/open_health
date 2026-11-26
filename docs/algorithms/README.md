@@ -4,33 +4,39 @@ Oura computes its daily metrics **on the phone**, in the native `ecore` engine
 (`libappecore.so`) - not in the cloud (the cloud is storage/sync). The one
 exception is the **sleep hypnogram**: ecore *consumes* a pre-computed 30-second
 stage array and only produces the staging *features*; the stager itself is the
-on-device **SleepNet** PyTorch model (encrypted `*.pt.enc` in `oura_models.apk`)
-and/or the ring firmware. Everything *downstream of staging* is deterministic and
+on-device **NSSA** PyTorch model (`sleepstaging_2_6_0`, encrypted `*.pt.enc` in
+`oura_models.apk`) and/or the ring firmware — **SleepNet** (`sleepnet_moonstone_*`,
+`sleepnet_bdi_*`) is a separate model that feeds apnea/SpO₂, not the app's stages.
+Everything *downstream of staging* is deterministic and
 portable.
 
-This directory documents each metric we port into `oura-analysis`. Source
-addresses refer to functions in the decompiled `libappecore.so` (see
-`native-decoder.md` for the Ghidra method). Per-metric detail files are added as
+This directory documents each metric we port. The ported code lives in this
+workspace — `crates/oura-models`, `oura-summary`, `nssa-plumbing`, `ibi-correct`;
+the `oura-analysis::…` names in the table below are the upstream `oura-analysis`
+crate, pulled in as a git dependency of `open_oura`, which still carries the earlier
+ports. Source addresses refer to functions in the decompiled `libappecore.so` (see
+`native-decoder.md` in the sibling `open_oura` repo for the Ghidra method).
+Per-metric detail files are added as
 each is ported; this index is the status table.
 
 ## Status
 
 | Metric | ecore source | Rust impl | Status |
 | --- | --- | --- | --- |
-| HRV (RMSSD) | `hrv @ 0x1e7984` (`sqrt(mean(diff(ibi)^2))`) | `oura-analysis::hrv` | ✅ ported + tested; validated on overnight IBI (RMSSD ~101 ms) |
+| HRV (RMSSD) | `hrv @ 0x1e7984` (`sqrt(mean(diff(ibi)^2))`) | `oura-analysis::hrv` | ✅ ported + tested; validated against real overnight IBI |
 | SpO2 (simple) | `spo2_simple_calculate @ 0x22ad50` (`a+b·R+c·R²`, clamp 0–120) | `oura-analysis::spo2` | ✅ ported + tested; needs per-device {a,b,c} |
 | Personal baseline | `baseline_update_lt_mean_and_dev @ 0x1dad04` (asymmetric EMA, anneals by age; int16 ×8) | `oura-analysis::baseline` | ✅ ported + tested (EMA; per-metric clamp tables unresolved) |
 | Nightly temperature + baseline | `nightly_temperature_calculate @ 0x203520`, `baseline_calculate_temperature_baseline @ 0x1db4d0` (7-sample median → 30-min window) | `oura-analysis::temperature` | ✅ ported + tested |
-| Breathing rate | `breathing_rate_calculate_averages @ 0x27342c` (IBI→RR @4 Hz→12-tap IIR) | - | ◐ IIR coefficients recovered; 4 Hz resample kernel unresolved - deferred |
+| Breathing rate | `breathing_rate_calculate_averages @ 0x27342c` (IBI→RR @4 Hz→12-tap IIR) | `tools/respiratory_rate.py`, `nssa-plumbing::breath` | ✅ ported: resample kernel implemented (`FS = 4.0`, 0.15–0.40 Hz band); `crates/nssa-plumbing/src/breath.rs` is the Rust port the dashboard uses |
 | Sleep durations / efficiency / latency | `calculate_sleep_score_numerical @ 0x1f4444` (decodes 30 s nibble stages) | `oura-analysis::sleep` | ✅ decode+summary ported (aggregation reconstructed) |
-| Sleep score + contributors | `ecore_sleep_score_calculate @ 0x1f5c20`; limits `…_init_limits_v2 @ 0x1f5b20` (from age byte) | - | ◐ limits + sleep_timing recovered; contributor mapper `FUN_001f5e64` not in export - needs re-decompile |
+| Sleep score + contributors | `ecore_sleep_score_calculate @ 0x1f5c20`; limits `…_init_limits_v2 @ 0x1f5b20` (from age byte) | `oura sleep-score` (CLI → `tools/score_sleep.py`); `oura-summary::sleep_score` (separate published-science score) | ✅ shipped live: limits + sleep_timing recovered, contributor curves and combiner weights fitted by `tools/calibrate_scores.py`; contributor mapper `FUN_001f5e64` still not in the export, so a bit-exact match vs ecore stays open |
 | Sleep debt | `sleep_debt_calculate @ 0x215658` | `oura-analysis::sleep_debt` | ✅ ported + tested |
-| Readiness score + contributors | `readiness_calculate @ 0x20897c`, `recovery_legacy_run @ 0x20b258` | - | ◐ legacy contributor formulas recovered; weight tables `0x17bff8`/`0x17bfdc` + modern `FUN_002094e0` need .rodata dump + re-decompile |
+| Readiness score + contributors | `readiness_calculate @ 0x20897c`, `recovery_legacy_run @ 0x20b258` | `oura readiness-score` (CLI → `tools/score_readiness.py`, over the daily summaries built by `tools/build_daily.py`) | ✅ shipped live: legacy contributor formulas + weights calibrated by `tools/calibrate_scores.py` (no `.rodata` dump needed on this path); weight tables `0x17bff8`/`0x17bfdc` + modern `FUN_002094e0` still unresolved |
 | Rest/recovery mode | `rest_recovery_* @ 0x20bf38…` | - | ⏳ to port |
 | Activity score + contributors | `get_activity_score_raw @ 0x1d5788` (per-contributor pw-interp, Y=[0,25,95,100]); combiner `@ 0x1d781c` | - | ◐ contributor curves + X-tables recovered; final-combiner divisor ambiguous - needs careful re-read |
 | Activity targets / cals / MET | `actinfo_target_to_cal @ 0x1cd2c8`, `actinfo_update_5_min_classification @ 0x1cd640` | `oura-analysis::metabolic` | ◐ VO2max/BMR/steps→m ported+tested; MET-class ordering + calorie/step regression best-effort |
 | Cycle prediction / tracking | `cycle_prediction_calculate @ 0x1e2864`, `cycle_tracking_calculate @ 0x1e4244` | - | ◐ day-type thresholds + 0.18–0.30 sine band recovered; fit_sin/sine_from_range unresolved - deferred |
-| **Sleep hypnogram (staging)** | NSSA PyTorch model (`sleepstaging_2_6_0`) + native `oura_ops` from libalgos.so - not in ecore | `tools/run_sleep_model.py`, iOS `SleepStaging.swift` | ✅ official pipeline reproduced (see [sleep-staging.md](sleep-staging.md)) |
+| **Sleep hypnogram (staging)** | NSSA PyTorch model (`sleepstaging_2_6_0`) + native `oura_ops` from libalgos.so - not in ecore | `tools/run_sleep_model.py`, iOS `SleepStaging.swift`, `crates/nssa-plumbing` (Rust port of the input/grid/cache half — `dashboard.rs` calls `nssa_plumbing::{cache,clock,grid,inputs}` and stages in-process) | ✅ official pipeline reproduced; only the TorchScript graphs stay Python (see [sleep-staging.md](sleep-staging.md)) |
 
 ## Device vs cloud (corrected)
 
@@ -45,7 +51,7 @@ host-supplied via `set_*` setters.
 debt, durations/efficiency, nightly temperature + baseline, HRV/RMSSD, resting-HR
 percentiles, breathing rate, simple SpO2, activity targets/calories/MET, cycle.
 
-**Not from ecore alone:** the **hypnogram** (needs the SleepNet model or the ring's
+**Not from ecore alone:** the **hypnogram** (needs the NSSA stager or the ring's
 staging), **SpO2 OVI** (NaN stub) and **BDI/apnea** scoring (delegated), and the
 exact **algorithm-version + baseline-state history** required to match Oura
 bit-for-bit.
@@ -75,7 +81,8 @@ this artifact alone.
 durations, HRV, resting HR, temperature deviation, MET) and the user's trends
 export pairs those with Oura's contributor sub-scores and final scores. A linear
 fit reproduces the **Sleep Score at R²=0.999** (and Readiness/Activity close) - see
-`data-recovery-map.md`. So `oura-analysis::score` will fit weights from the trends
+`data-recovery-map.md` in the sibling `open_oura` repo. So the scorers fit weights
+from the trends
 CSV rather than porting the unreadable `.rodata`; the decompiled structure
 (contributor set, the piecewise shape, the weighted-sum-/100 combination) guides
 the model. Bit-exact reproduction would need a cleaner build's `.rodata` or
