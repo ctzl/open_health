@@ -140,8 +140,9 @@ function batteryChart(ring) {
     svg.append(sv("text", { x: X + 2, y: H - 8, class: "rd-batt-lab" }, `${d.getMonth() + 1}/${d.getDate()}`));
   }
   for (const g of ring.gaps || []) {
+    if (g.kind === "unknown") continue; // past the last sync: show nothing
     if (g.to_s <= x0 || g.from_s >= x1) continue;
-    const what = g.kind === "unknown" ? "after last sync — unknown" : `gap (${g.kind})`;
+    const what = `gap (${g.kind})`;
     svg.append(sv("rect", {
       x: px(g.from_s), y: MT,
       width: Math.max(1, px(g.to_s) - px(g.from_s)), height: H - MT - MB,
