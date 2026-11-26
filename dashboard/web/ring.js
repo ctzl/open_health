@@ -166,20 +166,80 @@ function batteryChart(ring) {
   }
   const dp = pts.map((p, i) => `${i ? "L" : "M"}${px(p.t).toFixed(1)} ${py(p.pct).toFixed(1)}`).join(" ");
   svg.append(sv("path", { d: dp, fill: "none", stroke: "var(--accent)", "stroke-width": 1.6 }));
-  for (const p of pts) {
-    svg.append(sv("circle", { cx: px(p.t), cy: py(p.pct), r: 4, fill: "transparent" },
-      sv("title", {}, `${fmtDateTime(p.t)} · ${p.pct}%${p.mv > 0 ? ` · ${p.mv}mV` : ""}`)));
-  }
+
+  // Hover crosshair: snapping to the nearest reading is the whole point — the
+  // curve is event-driven, so the interesting datum is the change nearest the
+  // hovered instant, not whatever the interpolated line pixel says.
+  const cross = sv("line", {
+    y1: MT, y2: H - MB, stroke: "var(--muted)", "stroke-width": 1,
+    "stroke-dasharray": "2 2", visibility: "hidden",
+  });
+  const dot = sv("circle", {
+    r: 4, fill: "var(--accent)", stroke: "var(--surface-2)", "stroke-width": 1.5,
+    visibility: "hidden",
+  });
+  svg.append(cross, dot);
+  const tip = h("div", { class: "rd-batt-tip", hidden: true });
+  const hide = () => {
+    tip.hidden = true;
+    cross.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden");
+  };
+  const nearest = (t) => {
+    let lo = 0, hi = pts.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (pts[m].t < t) lo = m; else hi = m; }
+    return t - pts[lo].t <= pts[hi].t - t ? lo : hi;
+  };
+  svg.addEventListener("pointermove", (ev) => {
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return;
+    const pnt = svg.createSVGPoint();
+    pnt.x = ev.clientX;
+    pnt.y = ev.clientY;
+    const loc = pnt.matrixTransform(ctm.inverse());
+    if (loc.x < ML || loc.x > W - MR) { hide(); return; }
+    const t = x0 + ((loc.x - ML) / (W - ML - MR)) * (x1 - x0);
+    const i = nearest(t);
+    const q = pts[i];
+    const prev = i > 0 ? pts[i - 1] : null;
+    const inSess = sess.find((c) => q.t >= c.s && q.t <= c.e);
+    const inGap = (ring.gaps || []).find((g) => q.t >= g.from_s && q.t <= g.to_s);
+    cross.setAttribute("x1", loc.x);
+    cross.setAttribute("x2", loc.x);
+    cross.setAttribute("visibility", "");
+    dot.setAttribute("cx", px(q.t));
+    dot.setAttribute("cy", py(q.pct));
+    dot.setAttribute("visibility", "");
+    const age = now - q.t;
+    const lines = [
+      h("b", {}, `${q.pct}%${q.mv > 0 ? ` · ${q.mv} mV` : ""}`),
+      h("span", {}, fmtDateTime(q.t) + (age > 2 * 3600 ? ` · nearest reading, ${fmtDur(age)} ago` : "")),
+    ];
+    if (prev) lines.push(h("span", {}, `Δ vs previous: ${q.pct - prev.pct >= 0 ? "+" : ""}${q.pct - prev.pct}% over ${fmtDur(q.t - prev.t)}`));
+    if (inSess) lines.push(h("span", {}, `within charge session ${inSess.p1}% → ${inSess.p2}%`));
+    if (inGap) lines.push(h("span", {}, `within ${inGap.kind} gap`));
+    tip.replaceChildren(...lines);
+    const rect = svg.getBoundingClientRect(), wrapRect = wrap.getBoundingClientRect();
+    const sx = rect.width / W, sy = rect.height / H;
+    let left = rect.left - wrapRect.left + loc.x * sx + 12;
+    if (left > wrapRect.width - 235) left = rect.left - wrapRect.left + loc.x * sx - 247;
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${Math.max(0, rect.top - wrapRect.top + py(q.pct) * sy - 14)}px`;
+    tip.hidden = false;
+  });
+  svg.addEventListener("pointerleave", hide);
 
   const last = pts[pts.length - 1];
   const minp = Math.min(...pts.map((p) => p.pct));
-  return h("div", { class: "rd-batt" },
+  const wrap = h("div", { class: "rd-batt" },
     h("div", { class: "rd-batt-sum" },
       `latest ${last.pct}%${last.mv > 0 ? ` (${last.mv}mV)` : ""} at ${fmtDateTime(last.t)} · ` +
       `${sess.length} charge session(s) · min ${minp}% in window · ${pts.length} readings`),
     svg,
+    tip,
     h("div", { class: "rd-batt-legend" },
-      "solid = battery % (left scale) · dashed = pack mV (right scale) · green band = charging (hover for rate) · red/gray band = recording gap from the classifier above"));
+      "solid = battery % (left scale) · dashed = pack mV (right scale) · green band = charging · red/gray band = recording gap · hover the chart to read the nearest data point"));
+  return wrap;
 }
 
 function card(ring) {

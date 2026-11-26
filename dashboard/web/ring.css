@@ -65,7 +65,7 @@
 .rd-hcount { width: 30px; flex: none; text-align: right; font: 500 9px/1 var(--mono); color: var(--faint); }
 
 /* battery charge chart */
-.rd-batt { padding-top: 4px; }
+.rd-batt { position: relative; padding-top: 4px; }
 .rd-batt-sum { font: 540 12px/1.4 var(--mono); color: var(--muted); margin-bottom: 6px; }
 .rd-batt-svg {
   display: block; width: 100%; height: auto;
@@ -77,6 +77,14 @@
 .rd-batt-charging { fill: rgba(74, 222, 128, 0.05); }
 .rd-batt-charge { fill: rgba(74, 222, 128, 0.22); }
 .rd-batt-legend { font: 400 10px/1.5 var(--sans); color: var(--faint); margin-top: 6px; }
+/* hover readout: positioned by JS near the crosshair */
+.rd-batt-tip {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.rd-batt-tip b { display: block; font: 700 13px/1.4 var(--mono); color: var(--accent); }
+.rd-batt-tip span { display: block; font: 400 11px/1.5 var(--mono); color: var(--muted); }
 
 /* per-stream last-seen */
 .rd-streams { display: flex; flex-direction: column; }
