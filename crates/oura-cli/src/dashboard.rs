@@ -2681,6 +2681,48 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
         if gaps.len() > MAX_GAPS {
             gaps.drain(..gaps.len() - MAX_GAPS);
         }
+        // Battery curve: the fuel gauge emits debug_data battery_level_changed
+        // events whenever pct or voltage moves. They are buffered and burst at
+        // sync (captured_unix bunches), so their real time comes from the ring
+        // clock through the same anchors as the coverage map. Thinning keeps
+        // every pct change and >=1 point per 10 min of flat stretch; the last
+        // reading before the window stays as the line's left anchor.
+        let mut battery: Vec<Value> = Vec::new();
+        if let Some(tag_dbg) = tag_dbg {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT ring_timestamp, decoded_json FROM events
+                 WHERE serial = ?1 AND tag = ?2 AND ring_timestamp > ?3
+                   AND decoded_json LIKE '%battery_pct%'
+                 ORDER BY ring_timestamp",
+            ) {
+                let rows = stmt.query_map(rusqlite::params![&serial, tag_dbg, scan_from], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                });
+                let mut prev: Option<(i64, i64)> = None; // (t, pct)
+                if let Ok(q) = rows {
+                    for (rt, dj) in q.filter_map(|v| v.ok()) {
+                        let Some(dj) = dj else { continue };
+                        let Ok(parsed) = serde_json::from_str::<Value>(&dj) else { continue };
+                        let Some(pct) = parsed.get("battery_pct").and_then(Value::as_i64) else {
+                            continue;
+                        };
+                        let mv = parsed.get("voltage_mv").and_then(Value::as_i64).unwrap_or(-1);
+                        let t = to_wall(rt);
+                        if let Some((lt, lp)) = prev {
+                            if t - lt < 60 || (pct == lp && t - lt < 600) {
+                                continue;
+                            }
+                        }
+                        if t < cov_start - 7200 {
+                            prev = Some((t, pct));
+                            continue;
+                        }
+                        battery.push(json!({ "t": t, "pct": pct, "mv": mv }));
+                        prev = Some((t, pct));
+                    }
+                }
+            }
+        }
         let coverage: Vec<Value> = live_hours.iter().map(|h| json!({ "h": h })).collect();
         // Per-stream last-seen, oldest first: a stream that died is a clue.
         let mut stmt = match conn.prepare(
@@ -2721,6 +2763,7 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
             "last_sync_s": last_sync_s,
             "coverage": coverage,
             "gaps": gaps,
+            "battery": battery,
             "streams": streams,
             "log": log,
         }));
