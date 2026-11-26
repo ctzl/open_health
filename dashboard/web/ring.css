@@ -44,6 +44,7 @@
 }
 .rd-kind-poweroff { color: #f87171; border-color: rgba(248, 113, 113, 0.5); }
 .rd-kind-charging { color: var(--accent); border-color: rgba(74, 222, 128, 0.4); }
+.rd-kind-unknown { color: var(--muted); border-style: dashed; }
 .rd-gap-t { font: 400 11px/1.4 var(--mono); color: var(--muted); }
 .rd-gap-batt { grid-column: 2; font: 400 10px/1.5 var(--mono); color: var(--faint); }
 .rd-more {

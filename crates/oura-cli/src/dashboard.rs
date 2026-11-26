@@ -2639,6 +2639,18 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
             None
         };
         let mut gaps: Vec<Value> = Vec::new();
+        // Past the ring's last sync the state is UNKNOWABLE, not off-finger:
+        // the ring may be recording perfectly with everything still buffered
+        // on-device. Evidence ends at the last sync (the newest delivered
+        // event is the fallback when sync_state lags), so the hour-grid scan
+        // never claims a cause beyond that point.
+        let mut max_delivered = 0i64;
+        if let Ok(mut st) = conn.prepare("SELECT MAX(captured_unix) FROM events WHERE serial = ?1") {
+            if let Ok(v) = st.query_row(rusqlite::params![&serial], |r| r.get::<_, Option<i64>>(0)) {
+                max_delivered = v.unwrap_or(0);
+            }
+        }
+        let observed_until = last_sync_s.max(max_delivered);
         let mut h = cov_start / 3600;
         let h_end = now / 3600;
         while h <= h_end {
@@ -2647,8 +2659,8 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
                 while h + 1 <= h_end && !live_hours.contains(&(h + 1)) {
                     h += 1;
                 }
-                let ge = (h + 1) * 3600 - 1;
-                if ge - gs >= GAP_MIN_S {
+                let ge = ((h + 1) * 3600 - 1).min(observed_until.max(gs));
+                if gs < observed_until && ge - gs >= GAP_MIN_S {
                     let boot = boots
                         .iter()
                         .any(|&b| b >= gs - 300 && b <= ge + 900);
@@ -2677,6 +2689,17 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
                 }
             }
             h += 1;
+        }
+        // The tail past the observation cutoff is an explicit unknown — never
+        // guessed at as off-finger time.
+        let unknown_from = observed_until
+            .max(live_hours.iter().next_back().map_or(0, |lh| (lh + 1) * 3600));
+        if unknown_from > cov_start && now - unknown_from >= GAP_MIN_S {
+            gaps.push(json!({
+                "from_s": unknown_from, "to_s": now, "dur_s": now - unknown_from,
+                "kind": "unknown", "boot": false,
+                "batt_before": Value::Null, "batt_after": Value::Null,
+            }));
         }
         if gaps.len() > MAX_GAPS {
             gaps.drain(..gaps.len() - MAX_GAPS);
@@ -2761,6 +2784,7 @@ fn ring_diagnostics_inner(db: &Path, only_serial: &str) -> Value {
             "api_version": api_version,
             "mac": mac,
             "last_sync_s": last_sync_s,
+            "observed_until_s": observed_until,
             "coverage": coverage,
             "gaps": gaps,
             "battery": battery,

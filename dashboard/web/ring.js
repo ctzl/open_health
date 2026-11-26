@@ -60,9 +60,14 @@ function kv(k, v, cls) {
 // produced heart-rate/motion samples that hour (server already mapped ring
 // clock to wall clock via time_sync anchors; late sync delivery cannot fake
 // coverage because buffered replays keep their original sample times).
-function coverageHeatmap(coverage) {
-  const live = new Set(coverage.map((c) => c.h));
+// Hours that START past the ring's last sync are hatched: the ring may be
+// recording fine, we simply have no data yet — that is unknown, not an
+// off-hour. The hour containing the last sync itself stays NOT hatched:
+// its data up to the sync was delivered, so silence there is known.
+function coverageHeatmap(ring) {
+  const live = new Set((ring.coverage || []).map((c) => c.h));
   const nowH = Math.floor(Date.now() / 1000 / 3600);
+  const observedUntil = ring.observed_until_s || 0;
   const wrap = h("div", { class: "rd-heat" });
   const midnight = new Date();
   midnight.setHours(0, 0, 0, 0);
@@ -77,11 +82,12 @@ function coverageHeatmap(coverage) {
       t.setHours(hr, 0, 0, 0);
       const he = Math.floor(t.getTime() / 1000 / 3600);
       const future = he > nowH;
+      const unknown = !future && he * 3600 >= observedUntil;
       const isOn = live.has(he);
       if (isOn) on++;
       row.append(h("i", {
-        class: "rd-hx " + (future ? "rd-hx-off" : isOn ? "rd-hx-on" : "rd-hx-gap"),
-        title: `${fmtDateTime(he * 3600)} — ${isOn ? "recording" : future ? "" : "no samples"}`,
+        class: "rd-hx " + (future ? "rd-hx-off" : unknown && !isOn ? "rd-hx-unknown" : isOn ? "rd-hx-on" : "rd-hx-gap"),
+        title: `${fmtDateTime(he * 3600)} — ${isOn ? "recording" : future ? "" : unknown ? "after last sync — unknown" : "no samples"}`,
       }));
     }
     row.append(h("span", { class: "rd-hcount" }, `${on}h`));
@@ -135,11 +141,12 @@ function batteryChart(ring) {
   }
   for (const g of ring.gaps || []) {
     if (g.to_s <= x0 || g.from_s >= x1) continue;
+    const what = g.kind === "unknown" ? "after last sync — unknown" : `gap (${g.kind})`;
     svg.append(sv("rect", {
       x: px(g.from_s), y: MT,
       width: Math.max(1, px(g.to_s) - px(g.from_s)), height: H - MT - MB,
       class: "rd-batt-gap rd-batt-" + g.kind,
-    }, sv("title", {}, `gap (${g.kind}) ${fmtDateTime(g.from_s)} → ${fmtDateTime(g.to_s)}`)));
+    }, sv("title", {}, `${what} ${fmtDateTime(g.from_s)} → ${fmtDateTime(g.to_s)}`)));
   }
   const sess = [];
   for (let i = 1; i < pts.length; i++) {
@@ -266,25 +273,35 @@ function card(ring) {
     h("span", { class: "rd-sub" },
       "hours with no heart-rate/motion samples, anchored by the ring clock (time_sync). ",
       "power-off = the ring rebooted (a dead battery is off-finger time, not wear time); ",
-      "charging = battery rose across the gap; off-finger = powered but recording nothing.")));
+      "charging = battery rose across the gap; off-finger = powered but recording nothing; ",
+      "past the last sync nothing is knowable — that stretch is marked unknown, not off-finger.")));
+  const ev = gaps.filter((g) => g.kind !== "unknown");
+  const unk = gaps.filter((g) => g.kind === "unknown");
   if (!gaps.length) {
     card.append(h("p", { class: "rd-ok" }, "No empty hours over the last 14 days — the ring recorded continuously."));
   } else {
-    const total = gaps.reduce((a, g) => a + g.dur_s, 0);
-    const worst = Math.max(...gaps.map((g) => g.dur_s));
-    const KIND = { "power-off": "power-off", "charging": "charging", "idle": "off-finger" };
+    const total = ev.reduce((a, g) => a + g.dur_s, 0);
+    const worst = ev.length ? Math.max(...ev.map((g) => g.dur_s)) : 0;
+    const KIND = {
+      "power-off": "power-off", "charging": "charging", "idle": "off-finger",
+      "unknown": "unknown (not synced)",
+    };
     card.append(h("p", { class: "rd-stall-sum" },
-      `${gaps.length} gap(s) totalling ${fmtDur(total)} · longest ${fmtDur(worst)}`));
+      (ev.length
+        ? `${ev.length} gap(s) totalling ${fmtDur(total)} · longest ${fmtDur(worst)}`
+        : "No evidence-backed gaps in synced data") +
+      (unk.length ? ` · ${fmtDur(unk.reduce((a, g) => a + g.dur_s, 0))} unknown since ${fmtDateTime(unk[0].from_s)} (no sync since)` : "")));
     const list = h("div", { class: "rd-gaps" });
     const ordered = [...gaps].reverse();
     const batt = (b) => (b && b.pct >= 0 ? `${b.pct}% ${b.mv}mV` : "no reading");
     const row = (g) => h("div", { class: "rd-gap" + (g.kind === "power-off" ? " rd-gap-poweroff" : "") },
-      h("span", { class: "rd-stall-d" }, fmtDur(g.dur_s)),
+      h("span", { class: "rd-stall-d", style: g.kind === "unknown" ? "color:var(--faint)" : "" }, fmtDur(g.dur_s)),
       h("div", {},
         h("span", { class: "rd-gap-kind rd-kind-" + g.kind }, KIND[g.kind] || g.kind),
         h("span", { class: "rd-gap-t" }, `${fmtDateTime(g.from_s)} → ${fmtDateTime(g.to_s)}`),
-        h("div", { class: "rd-gap-batt" },
-          `battery: ${batt(g.batt_before)} → ${batt(g.batt_after)}${g.boot ? " · ring rebooted in this gap" : ""}`)));
+        h("div", { class: "rd-gap-batt" }, g.kind === "unknown"
+          ? "no data delivered past the last sync — the ring may or may not have been recording"
+          : `battery: ${batt(g.batt_before)} → ${batt(g.batt_after)}${g.boot ? " · ring rebooted in this gap" : ""}`)));
     for (const g of ordered.slice(0, 8)) list.append(row(g));
     if (ordered.length > 8) {
       const rest = h("div", { class: "rd-rest", hidden: true });
@@ -303,8 +320,8 @@ function card(ring) {
     h("span", { class: "rd-sub" }, "fuel-gauge readings timed on the ring clock · last 14 days · charge sessions and gap bands overlaid")));
   card.append(batteryChart(ring));
 
-  card.append(h("h3", {}, h("span", {}, "Wearing coverage"), h("span", { class: "rd-sub" }, "one cell per hour · green = heart-rate/motion samples present · last 14 days")));
-  card.append(coverageHeatmap(ring.coverage || []));
+  card.append(h("h3", {}, h("span", {}, "Wearing coverage"), h("span", { class: "rd-sub" }, "one cell per hour · green = heart-rate/motion samples present · hatched = past last sync (unknown) · last 14 days")));
+  card.append(coverageHeatmap(ring));
 
   const streams = ring.streams || [];
   if (streams.length) {
