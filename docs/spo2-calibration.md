@@ -47,8 +47,9 @@ clamp or the tags changes between the two paths — `tools/run_spo2.py` below is
 standalone oracle/checker.
 
 **Ring 5 caveat:** its exact hardware→coefficient mapping isn't pinned down in the
-decompiled app (v7.18 predates Ring 5 in that table); the two sets differ by <1% on
-our data, so the result is robust either way. Default is gen4/oreo.
+decompiled app (the captured XAPK manifest 7.15.0 predates Ring 5 in that
+table); the two sets differ by <1% on our data, so the result is robust either
+way. Default is gen4/oreo.
 
 ## Running it
 
