@@ -129,7 +129,10 @@ pub fn estimate(args: &[String]) -> Result<StressOutput> {
     let args = parse_args(args)?;
     let repo = match &args.repo {
         Some(r) => PathBuf::from(r),
-        None => std::env::current_dir().context("resolve repo root (pass --repo)")?,
+        // Same contract as the CLI's pyrunner::repo_root: walk up from the cwd
+        // (then from this crate's source dir) looking for the model script, so
+        // the in-process path works no matter where the server was started.
+        None => find_repo_root().context("resolve repo root (pass --repo)")?,
     };
     let (series, baseline) = match &args.dsa_json {
         // Pre-captured run_stress_model.py output: no Python, no torch.
@@ -295,6 +298,24 @@ pub fn json_for_args(argv: &[String]) -> Result<String> {
 // ---------------------------------------------------------------------------
 // DSA series (stress_daytime_sensing stays in Python for now)
 // ---------------------------------------------------------------------------
+
+/// Locates the repo root by walking up from the cwd (then from this crate's
+/// compiled-in source dir) looking for `tools/run_stress_model.py`. Same shape
+/// as the CLI's pyrunner::repo_root — kept local because `oura-models` is a
+/// leaf crate and can't depend on `oura-cli` where that helper lives.
+fn find_repo_root() -> Option<PathBuf> {
+    let marker = Path::new("tools").join("run_stress_model.py");
+    let find = |start: &Path| -> Option<PathBuf> {
+        start
+            .ancestors()
+            .find(|d| d.join(&marker).is_file())
+            .map(Path::to_path_buf)
+    };
+    std::env::current_dir()
+        .ok()
+        .and_then(|d| find(&d))
+        .or_else(|| find(Path::new(env!("CARGO_MANIFEST_DIR"))))
+}
 
 /// Spawn `tools/run_stress_model.py --json` the way the oracle's
 /// `stress_series()` does, and return its parsed output.
@@ -1135,4 +1156,19 @@ pub fn fmt_local(unix: Option<f64>, tz_hours: i64) -> String {
     let rem = micros.rem_euclid(day_us) / 1_000_000;
     let (_y, m, d) = civil_from_days(days as i64);
     format!("{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dashboard calls this model in-process from an arbitrary cwd; the
+    /// marker walk must still resolve the repo (seen broken when the server
+    /// was launched from `dashboard/`, making cwd-based resolution look for
+    /// `dashboard/tools/run_stress_model.py`).
+    #[test]
+    fn repo_root_resolves_from_any_directory() {
+        let root = find_repo_root().expect("marker walk finds the repo root");
+        assert!(root.join("tools").join("run_stress_model.py").is_file());
+    }
 }
