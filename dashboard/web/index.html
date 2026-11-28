@@ -11,43 +11,38 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <div class="brand">
-        <span class="mark" aria-hidden="true"></span>
-        <span class="brand-copy">
-          <span class="word">open_oura</span>
-          <span class="brand-meta">local health observatory</span>
-        </span>
+      <div class="top-main">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="brand-copy">
+            <span class="word">open_oura</span>
+            <span class="brand-meta">local health observatory</span>
+          </span>
+        </div>
+        <div class="actions">
+          <span class="toolgroup" role="group" aria-label="Ring controls">
+            <button id="ring-btn" class="action" title="Switch profile (ring)">
+              <span class="ic" style="--i:url(/icons/ring.svg)"></span>
+              <span id="ring-label">Profile</span>
+            </button>
+            <span id="batt" class="batt" title="Ring battery"></span>
+            <button id="sync-btn" class="action" title="Sync the ring over Bluetooth">
+              <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
+              <span id="sync-label">Sync</span>
+            </button>
+          </span>
+          <button id="profile-btn" class="action icon-only" title="Edit your details" aria-label="Edit profile">
+            <span class="ic" style="--i:url(/icons/user.svg)"></span>
+          </button>
+        </div>
       </div>
-      <div class="actions">
-        <button id="ring-btn" class="action" title="Switch profile (ring)">
-          <span class="ic" style="--i:url(/icons/ring.svg)"></span>
-          <span id="ring-label">Profile</span>
-        </button>
-        <span id="batt" class="batt" title="Ring battery"></span>
-        <button id="sync-btn" class="action" title="Sync the ring over Bluetooth">
-          <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
-          <span id="sync-label">Sync</span>
-        </button>
-        <a id="dna-link" class="action" href="/dna" title="Explore your DNA">
-          <span class="ic" style="--i:url(/icons/dna.svg)"></span>
-          <span>DNA</span>
-        </a>
-        <a id="blood-link" class="action" href="/blood" title="Blood test panel">
-          <span class="ic" style="--i:url(/icons/drop.svg)"></span>
-          <span>Blood</span>
-        </a>
-        <a id="logs-link" class="action" href="/logs" title="Sync and model run logs">
-          <span class="ic" style="--i:url(/icons/terminal.svg)"></span>
-          <span>Logs</span>
-        </a>
-        <a id="ring-link" class="action" href="/ring" title="Ring health diagnostics">
-          <span class="ic" style="--i:url(/icons/ring.svg)"></span>
-          <span>Rings</span>
-        </a>
-        <button id="profile-btn" class="action icon-only" title="Edit your details" aria-label="Edit profile">
-          <span class="ic" style="--i:url(/icons/user.svg)"></span>
-        </button>
-      </div>
+      <nav class="subnav" aria-label="Sections">
+        <a href="/" class="on" aria-current="page">Overview</a>
+        <a href="/dna">DNA</a>
+        <a href="/blood">Blood</a>
+        <a href="/ring">Ring health</a>
+        <a href="/logs">Logs</a>
+      </nav>
     </header>
 
     <section class="brief" aria-labelledby="brief-label">

@@ -139,20 +139,24 @@ body {
   padding: clamp(20px, 3.5vh, 44px) clamp(20px, 3vw, 40px) clamp(64px, 10vh, 120px);
 }
 
-/* ── header (flat instrument bar, hairline underline) ───── */
+/* ── header (flat instrument bar: utility row + section tabs) ─ */
 .top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   position: sticky;
   top: 0;
   z-index: 30;
   margin-bottom: var(--s4);
-  padding: var(--s2) 2px var(--s3);
+  padding: var(--s2) 2px var(--s2);
   background: color-mix(in oklab, var(--bg) 88%, transparent);
   -webkit-backdrop-filter: blur(18px) saturate(130%);
   backdrop-filter: blur(18px) saturate(130%);
   border-bottom: 1px solid var(--line);
+}
+.top-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  padding-bottom: var(--s3);
 }
 .brand { display: flex; align-items: center; gap: 11px; }
 .mark {
@@ -168,6 +172,28 @@ body {
 }
 
 .actions { display: flex; align-items: center; gap: 8px; }
+/* device controls read as one unit, separate from account controls */
+.toolgroup {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding-right: 9px; margin-right: 1px;
+  border-right: 1px solid var(--line);
+}
+/* section tabs (second row of the instrument bar) */
+.subnav {
+  display: flex; align-items: center; gap: 2px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 9px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.subnav::-webkit-scrollbar { display: none; }
+.subnav a {
+  font-family: var(--sans); font-size: 12.5px; font-weight: 520;
+  color: var(--muted); text-decoration: none; white-space: nowrap;
+  padding: 5px 10px; border-radius: var(--radius-sm);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.subnav a:hover { color: var(--text); background: var(--surface); }
+.subnav a.on { color: var(--accent); background: var(--accent-soft); }
 .batt {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums;
@@ -804,8 +830,10 @@ body.page-open { overflow: hidden; }
   .dashboard-grid #device-panel .dh-stats { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 520px) {
-  .top { align-items: flex-start; }
+  .top-main { align-items: flex-start; }
   .actions { gap: 5px; }
+  .toolgroup { gap: 5px; padding-right: 6px; }
+  .subnav { margin: 0 -2px; padding-inline: 2px; }
   .action { padding-inline: 9px; }
   .action span:not(.ic), .batt { display: none; }
   .action.icon-only { padding: 7px; }

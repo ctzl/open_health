@@ -13,20 +13,25 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <div class="brand">
-        <span class="mark" aria-hidden="true"></span>
-        <span class="word">open_oura</span>
-        <span class="dna-sub">ring diagnostics</span>
+      <div class="top-main">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="word">open_oura</span>
+          <span class="dna-sub">ring diagnostics</span>
+        </div>
+        <div class="actions">
+          <button class="lg-btn" id="rd-refresh" title="Re-run diagnostics">
+            <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
+          </button>
+        </div>
       </div>
-      <div class="actions">
-        <a class="action" href="/" title="Back to dashboard">
-          <span class="ic" style="--i:url(/icons/arrow-left.svg)"></span>
-          <span>Dashboard</span>
-        </a>
-        <button class="lg-btn" id="rd-refresh" title="Re-run diagnostics">
-          <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
-        </button>
-      </div>
+      <nav class="subnav" aria-label="Sections">
+        <a href="/">Overview</a>
+        <a href="/dna">DNA</a>
+        <a href="/blood">Blood</a>
+        <a href="/ring" class="on" aria-current="page">Ring health</a>
+        <a href="/logs">Logs</a>
+      </nav>
     </header>
 
     <p class="digest">

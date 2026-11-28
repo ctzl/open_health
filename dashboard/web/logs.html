@@ -12,17 +12,20 @@
 <body>
   <div class="wrap">
     <header class="top">
-      <div class="brand">
-        <span class="mark" aria-hidden="true"></span>
-        <span class="word">open_oura</span>
-        <span class="dna-sub">activity logs</span>
+      <div class="top-main">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="word">open_oura</span>
+          <span class="dna-sub">activity logs</span>
+        </div>
       </div>
-      <div class="actions">
-        <a class="action" href="/" title="Back to dashboard">
-          <span class="ic" style="--i:url(/icons/arrow-left.svg)"></span>
-          <span>Dashboard</span>
-        </a>
-      </div>
+      <nav class="subnav" aria-label="Sections">
+        <a href="/">Overview</a>
+        <a href="/dna">DNA</a>
+        <a href="/blood">Blood</a>
+        <a href="/ring">Ring health</a>
+        <a href="/logs" class="on" aria-current="page">Logs</a>
+      </nav>
     </header>
 
     <p class="digest">
